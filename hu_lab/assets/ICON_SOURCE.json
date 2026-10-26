@@ -1,0 +1,22 @@
+{
+  "asset": "carlife-icon.png",
+  "source_file": "carlife-icon-source.jpg",
+  "product": "百度CarLife+",
+  "publisher": "Beijing Baidu Netcom Science & Technology Co.,Ltd",
+  "app_store_id": 944140737,
+  "app_store_version": "8.8.8",
+  "official_product_page": "https://apps.apple.com/cn/app/id944140737",
+  "official_baidu_product_page": "https://carlife.baidu.com/",
+  "identity_metadata_url": "https://itunes.apple.com/lookup?id=944140737&country=cn",
+  "source_image_url": "https://is1-ssl.mzstatic.com/image/thumb/Purple221/v4/76/3c/36/763c36ce-381c-58cf-ffb5-1689353fcb88/AppIcon-1x_U007emarketing-0-3-0-0-sRGB-85-220-0.png/512x512bb.jpg",
+  "retrieved_date": "2026-10-25",
+  "dimensions": [
+    512,
+    512
+  ],
+  "transparency": "Official square artwork has an opaque white background; preserved.",
+  "processing": "JPEG decoded and losslessly stored as RGBA PNG for Qt, then resized/encoded as ICNS and ICO during packaging. No redraw, crop, recolor, or AI generation.",
+  "source_sha256": "4ba08e56aa4a610b7eb07e9a8d6b4a0c1dc7bcf686288d97756fe0bc032163c1",
+  "png_sha256": "b5c54aa6cb530c1e523f5fe05d6441c56cd804ec3e52f9a89b0639cf91fe4bf6",
+  "rights": "Baidu CarLife name and artwork remain the property of Baidu. Included for product identification at the user request; not covered by the project Apache-2.0 license and not a claim of Baidu endorsement."
+}

@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+CARLIFE_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if [ -n "${HU_PYTHON:-}" ]; then
+    CARLIFE_PYTHON=$HU_PYTHON
+elif [ -x "$CARLIFE_ROOT/.venv/bin/python" ]; then
+    CARLIFE_PYTHON=$CARLIFE_ROOT/.venv/bin/python
+else
+    CARLIFE_PYTHON=python3
+fi
+exec "$CARLIFE_PYTHON" "$CARLIFE_ROOT/windows/build.py" "$@"
