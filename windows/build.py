@@ -166,7 +166,11 @@ def trim_qt_and_verify(stage):
     for path in binaries:
         by_name.setdefault(path.name.lower(), []).append(path)
     selected = {p for p in binaries if not p.is_relative_to(qt)}
-    selected.update(qt / f"{name}.pyd" for name in ("QtCore", "QtGui", "QtWidgets", "QtMultimedia"))
+    # QtMultimedia imports the QtNetwork Python binding through Shiboken during
+    # module initialization. Qt6Network.dll's PE dependency cannot retain this
+    # separately loaded .pyd; both the binding and its DLL closure are required.
+    selected.update(qt / f"{name}.pyd" for name in
+                    ("QtCore", "QtGui", "QtWidgets", "QtNetwork", "QtMultimedia"))
     # These are loaded by Qt's plugin manager, not in the PE import table.
     plugins = ("platforms/qwindows.dll", "platforms/qoffscreen.dll", "platforms/qminimal.dll",
                "styles/qmodernwindowsstyle.dll", "multimedia/windowsmediaplugin.dll",
