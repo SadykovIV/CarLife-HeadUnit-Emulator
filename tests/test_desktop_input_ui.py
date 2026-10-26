@@ -251,12 +251,16 @@ class DesktopInputWindowTests(unittest.TestCase):
             QTest.mousePress(surface, Qt.LeftButton, Qt.AltModifier, position)
             self.assertTrue(surface.touch_input.pinching)
             surface.touch_input.scale_pinch(100)
+            # Bounds are quantized to the nearest video pixel. Its centre can
+            # lie half a video pixel beyond a cropped edge; in Qt logical
+            # coordinates that tolerance grows with the rendering scale.
+            tolerance = surface.transform.scale / 2 + 1e-6
             for pointer in surface.touch_input.pointers:
                 x, y = surface.transform.video_to_view(pointer.x, pointer.y)
-                self.assertGreaterEqual(x, -1)
-                self.assertGreaterEqual(y, -1)
-                self.assertLessEqual(x, surface.width() + 1)
-                self.assertLessEqual(y, surface.height() + 1)
+                self.assertGreaterEqual(x, -tolerance)
+                self.assertGreaterEqual(y, -tolerance)
+                self.assertLessEqual(x, surface.width() + tolerance)
+                self.assertLessEqual(y, surface.height() + tolerance)
                 self.assertTrue(client.input_content_contains(pointer.x, pointer.y))
             QTest.mouseRelease(surface, Qt.LeftButton, Qt.AltModifier, position)
             self.assertFalse(client.pending_touch)
