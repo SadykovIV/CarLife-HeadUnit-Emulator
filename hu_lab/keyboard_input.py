@@ -5,6 +5,8 @@ clipboard reads, or invented CarLife text messages. Clipboard paste is typing
 host text into the focused Android field, not clipboard synchronization.
 
 Wire specification: https://source.android.com/docs/core/interaction/accessories/aoa2
+Android implementation details (ID bounds and GET_PROTOCOL side effects):
+https://android.googlesource.com/kernel/common/+/refs/heads/android15-6.6/drivers/usb/gadget/function/android_f_accessory.c
 Layout assumptions: Android Generic.kcm and InputDevices' keyboard_layout_russian.kcm.
 Select the corresponding physical-keyboard layout on Android and turn Caps Lock
 off. US supports ASCII; Russian supports standard ЙЦУКЕН characters/digits and
@@ -171,10 +173,14 @@ class HIDKeyboard:
     never perform USB IO on the GUI thread. A failure disables only keyboard IO;
     the shared USB handle and CarLife session are never closed by this object.
     """
-    def __init__(self, handle=None, *, unavailable_reason=None, hid_id=0x434c,
-                 key_interval=.008):
-        if type(hid_id) is not int or not 0 < hid_id <= 65535:
-            raise ValueError('Invalid HID ID')
+    def __init__(self, handle=None, *, unavailable_reason=None, hid_id=1,
+                 aoa_protocol=None, key_interval=.008):
+        # Current Android accessory drivers accept IDs 1..MAX_HID_DEVICES (32),
+        # even though the USB request's wValue field is sixteen bits wide.
+        if type(hid_id) is not int or not 1 <= hid_id <= 32:
+            raise ValueError('HID ID must be an integer from 1 to 32')
+        if aoa_protocol is not None and (type(aoa_protocol) is not int or aoa_protocol not in (1, 2)):
+            raise ValueError('Known AOA protocol must be 1 or 2')
         if not 0 <= key_interval <= .1:
             raise ValueError('Invalid keyboard interval')
         self.handle, self.hid_id = handle, hid_id
@@ -188,8 +194,11 @@ class HIDKeyboard:
         self.pending_keys = self.sent_keys = self.cancelled_keys = 0
         self.release_requested = False
         self.status, self.error = 'idle', None
-        self.protocol = None
+        self.cleanup_errors = []
+        self.protocol = aoa_protocol
         self.registered = False
+        self.registration_uncertain = False
+        self.descriptor_ready = False
         self.worker = None
 
     @classmethod
@@ -199,13 +208,17 @@ class HIDKeyboard:
         if (getattr(client, 'backend', None) != 'DIRECT_USB_AOA' or handle is None
                 or not callable(getattr(handle, 'hid_control', None))):
             return cls(unavailable_reason='AOA HID keyboard is available only over native USB; CarLife TCP has no text channel')
-        return cls(handle)
+        protocol = getattr(stream, 'evidence', {}).get('aoa_version')
+        return cls(handle, aoa_protocol=protocol if type(protocol) is int and protocol in (1, 2) else None)
 
     def snapshot(self):
         with self.condition:
             return {'status': self.status, 'available': self.status == 'ready',
                     'aoa_protocol': self.protocol, 'registered': self.registered,
+                    'registration_uncertain': self.registration_uncertain,
+                    'descriptor_ready': self.descriptor_ready,
                     'error': self.error, 'reason': self.reason,
+                    'cleanup_errors': list(self.cleanup_errors),
                     'pending_keys': self.pending_keys, 'sent_keys': self.sent_keys,
                     'cancelled_keys': self.cancelled_keys,
                     'worker_alive': bool(self.worker and self.worker.is_alive()),
@@ -216,23 +229,35 @@ class HIDKeyboard:
     def _event(self, report):
         self.handle.hid_control(57, self.hid_id, data=report)
 
+    def _record_cleanup_errors(self, errors):
+        with self.condition:
+            for error in errors:
+                if error not in self.cleanup_errors:
+                    self.cleanup_errors.append(error)
+            # Preserve the primary startup/input error if one already exists.
+            # A cleanup-only failure still needs a useful keyboard status.
+            if self.error is None:
+                self.error = '; '.join(errors)
+            self.status = 'failed'
+
     def _cleanup(self):
         errors = []
-        if self.registered:
-            try:
-                self._event(RELEASE_REPORT)
-            except Exception as error:
-                errors.append(f'release: {type(error).__name__}: {error}')
+        if self.registered or self.registration_uncertain:
+            if self.descriptor_ready:
+                try:
+                    self._event(RELEASE_REPORT)
+                except Exception as error:
+                    errors.append(f'release: {type(error).__name__}: {error}')
             try:
                 self.handle.hid_control(55, self.hid_id)
             except Exception as error:
                 errors.append(f'unregister: {type(error).__name__}: {error}')
             finally:
                 self.registered = False
+                self.registration_uncertain = False
+                self.descriptor_ready = False
         if errors:
-            with self.condition:
-                self.error = '; '.join(filter(None, [self.error, *errors]))
-                self.status = 'failed'
+            self._record_cleanup_errors(errors)
 
     def start(self):
         with self.lifecycle:
@@ -241,20 +266,32 @@ class HIDKeyboard:
             if self.handle is None:
                 self.status = 'unavailable'
                 return self.snapshot()
+            self.status = 'starting'
             try:
-                self.protocol = self.handle.get_protocol()
-                if self.protocol != 2:
+                # Never repeat GET_PROTOCOL (51) on an active accessory: Android
+                # handles it by clearing its accessory strings/start_requested.
+                # Use the version captured before START; an existing accessory
+                # with unknown version can advertise HID by accepting REGISTER.
+                if self.protocol == 1:
                     self.status = 'unavailable'
                     self.reason = 'The selected accessory does not advertise AOA 2.0 HID'
                     return self.snapshot()
-                # An unknown REGISTER outcome is cleaned up once, never retried.
+                try:
+                    self.handle.hid_control(54, self.hid_id, index=len(KEYBOARD_REPORT_DESCRIPTOR))
+                except USBError as error:
+                    # PIPE is a definite rejection: no HID exists to release or
+                    # unregister. A timeout/IO interruption may have registered
+                    # it; make one unregister attempt, never replay REGISTER.
+                    self.registration_uncertain = error.code in (-1, -7, -10)
+                    raise
                 self.registered = True
-                self.handle.hid_control(54, self.hid_id, index=len(KEYBOARD_REPORT_DESCRIPTOR))
+                self.protocol = 2
                 maximum = getattr(self.handle, 'descriptor', {}).get('endpoint0_max_packet', 64)
                 chunk = maximum if maximum in (8, 16, 32, 64, 512) else 64
                 for offset in range(0, len(KEYBOARD_REPORT_DESCRIPTOR), chunk):
                     self.handle.hid_control(56, self.hid_id, index=offset,
                                             data=KEYBOARD_REPORT_DESCRIPTOR[offset:offset + chunk])
+                self.descriptor_ready = True
                 # Android constructs HID on a worker after the descriptor. Only
                 # an all-keys-up report is safe to retry while that worker starts.
                 deadline = time.monotonic() + 1
@@ -362,9 +399,7 @@ class HIDKeyboard:
             if self.worker:
                 self.worker.join(timeout=2)
                 if self.worker.is_alive():
-                    with self.condition:
-                        self.status = 'failed'
-                        self.error = 'Keyboard worker did not stop within its bounded timeout'
+                    self._record_cleanup_errors(['Keyboard worker did not stop within its bounded timeout'])
             else:
                 self._cleanup()
                 if self.status not in ('failed', 'unavailable'):

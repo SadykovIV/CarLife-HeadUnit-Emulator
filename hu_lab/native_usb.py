@@ -19,8 +19,11 @@ from .usb import LibUSB, RecoveryBlocked, USBIdentity, select_exact
 from .platform_support import lock_owner, open_owner_lock, unlock_owner, usb_lock_directory
 
 ACCESSORY_IDS = ((0x18d1, 0x2d00), (0x18d1, 0x2d01))
-DEFAULT_STRINGS = ("Mac HU Lab", "CarLife HU", "CarLife video/input engineering pilot",
-                   "1.0", "", "MacHULab-P1")
+# Android dispatches USB_ACCESSORY_ATTACHED using manufacturer/model/version.
+# These CarLife identifiers match HeadSwap and CarProjection accessory filters;
+# the former laboratory identity switches USB mode but does not launch them.
+DEFAULT_STRINGS = ("Baidu", "CarLife", "Baidu CarLife",
+                   "1.0.0", "http://carlife.baidu.com/", "0720SerialNo.")
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,7 @@ class USBStream:
         self.send_lock = threading.Lock()
         self.first_write_complete = False
         self.write_failed = False
+        self.failure_reason = None
         self.observer = observer
         self.rx_bytes = self.tx_bytes = 0
         self.pending = bytearray()
@@ -142,6 +146,9 @@ class USBStream:
                 # A timeout may have sent a prefix. Never retry this logical
                 # write or grant another startup window on this stream.
                 self.write_failed = True
+                # Publish the cause before cancel wakes the reader. Otherwise
+                # its InterruptedError can win the client failure race.
+                self.failure_reason = f"{type(error).__name__}: {error}"
                 self.handle.cancel.set()
                 if first and self.observer:
                     self.observer("usb_first_write_failed", bytes=len(data), deadline_seconds=budget,

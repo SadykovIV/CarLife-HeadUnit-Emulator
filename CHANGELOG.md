@@ -9,8 +9,11 @@ First GitHub release of the standalone **CarLife HeadUnit Emulator**, extracted 
 - Publish a focused desktop source tree, English and Russian READMEs, build instructions, automated tests and third-party notices.
 - Retain the 0.3.0 interface and features: top connection/device selection, always-enabled USB AOA transport, dark/light/system themes, video/audio diagnostics, two-contact input and optional AOA 2.0 US/RU HID keyboard with one-way host clipboard paste.
 - Keep Legacy dual as the default two-contact profile and Action3 as an explicit device compatibility option.
+- Use the standard Baidu/CarLife accessory identity so Android can launch HeadSwap and other applications with CarLife USB accessory filters.
+- Fix USB HID registration: use Android-compatible ID 1, reuse the AOA version captured during connection, and avoid a second GET_PROTOCOL request that can clear accessory identity. Start optional HID only after CarLife reaches STREAMING.
+- Do not send release/unregister after a definite registration rejection; distinguish optional keyboard errors from cleanup failures. Preserve the original USB write failure when cancellation wakes the reader first.
 
-The current macOS arm64 package requires macOS 26+. The Windows x64 portable package is cross-built and has not been run on Windows. Physical HID text delivery remains unverified; this release does not expand the prior hardware compatibility claims. See the [validation history and limits](docs/MAC_HEADUNIT_APP.md#проверка-готовой-сборки).
+The current macOS arm64 package requires macOS 26+. The Windows x64 portable package is cross-built and has not been run on Windows. A source run with one HeadSwap device confirmed USB negotiation, video and HID registration/cleanup. Physical HID text delivery remains unverified. See the [validation history and limits](docs/MAC_HEADUNIT_APP.md#проверка-готовой-сборки).
 
 ## 0.3.0 — 2026-10-25
 

@@ -12,7 +12,7 @@ Get the appropriate ZIP from [GitHub Releases](https://github.com/SadykovIV/CarL
 
 | Package | Requirements and launch | Validation boundary |
 | --- | --- | --- |
-| `CarLife-HeadUnit-Emulator-0.3.1-macOS-arm64.zip` | Apple Silicon, **macOS 26+**. Extract and open `CarLife HeadUnit Emulator.app`. | macOS application and synthetic demo tested. An earlier build was tested with one physical Android box; this does not validate every device or the new HID input. |
+| `CarLife-HeadUnit-Emulator-0.3.1-macOS-arm64.zip` | Apple Silicon, **macOS 26+**. Extract and open `CarLife HeadUnit Emulator.app`. | macOS application and synthetic demo tested. USB negotiation, video and HID registration were also checked from source with one HeadSwap device; text delivery is still unverified. |
 | `CarLife-HeadUnit-Emulator-0.3.1-Windows-x64.zip` | Windows x64. Extract the **whole folder**, then run `CarLifeHeadUnitEmulator.exe`. | Cross-built package with dependency/hash/PE checks. **Not run on Windows**; Windows GUI, audio, USB drivers and physical HID delivery remain unverified. |
 
 The macOS package has an ad hoc signature and is not notarized; the Windows executable is not Authenticode signed. The current macOS minimum comes from its bundled native libraries. Do not move the Windows executable away from the accompanying runtime files.
@@ -48,11 +48,11 @@ The connection controls stay at the top. Tabs provide **Экран** (Screen), *
 
 ## Keyboard, clipboard and compatibility
 
-Enable **«Клавиатура по USB»** (USB keyboard) before connecting. This optional HID setting is separate from the always-enabled USB AOA transport. The device must accept AOA 2.0 HID registration. Choose **US** or **RU**, select the same **physical keyboard layout on Android**, and keep **Caps Lock off**. Click the remote text field before typing or pasting.
+Enable **«Клавиатура по USB»** (USB keyboard) before connecting. This optional HID setting is separate from the always-enabled USB AOA transport. HID registration starts after the CarLife stream is established. The device must accept AOA 2.0 HID registration. Choose **US** or **RU**, select the same **physical keyboard layout on Android**, and keep **Caps Lock off**. Click the remote text field before typing or pasting.
 
 Paste sends local clipboard text as physical key presses **from the computer to the device only**. It does not read the Android clipboard or synchronize clipboards, and it does not use ADB. Supported text is US printable ASCII or the standard Russian ЙЦУКЕН layout and its mapped punctuation; arbitrary Unicode, emoji and automatic mixed-layout input are unsupported. An unsupported character rejects the entire submission. Each submission is limited to 4,096 characters; Enter and Tab retain their usual field actions. Text is not written to session logs.
 
-**Actual text delivery through HID has not been confirmed on physical hardware.** Automated HID tests use a fake USB backend. Multitouch behavior also depends on the device's implementation. Commercial OEM authentication, Bluetooth HFP and generic CarLife Wi-Fi are not implemented. On Windows, libusb needs a compatible driver for the selected USB interface; the application does not install or change drivers.
+**Actual text delivery through HID has not been confirmed on physical hardware.** A source run with HeadSwap confirmed USB negotiation, video and HID registration/cleanup; automated HID tests use a fake USB backend. Multitouch behavior also depends on the device's implementation. Commercial OEM authentication, Bluetooth HFP and generic CarLife Wi-Fi are not implemented. On Windows, libusb needs a compatible driver for the selected USB interface; the application does not install or change drivers.
 
 ## Run from source
 

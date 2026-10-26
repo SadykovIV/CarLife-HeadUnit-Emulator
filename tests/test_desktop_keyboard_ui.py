@@ -38,6 +38,8 @@ class FakeKeyboard:
 
     def start(self):
         self.start_thread = threading.get_ident()
+        self.start_state = self.client.session.state
+        if self.status == 'idle': self.status = 'ready'
         return self.snapshot()
 
     def snapshot(self):
@@ -217,6 +219,32 @@ class DesktopKeyboardWindowTests(unittest.TestCase):
         self.assertTrue(keyboard.closed_before_client_stop)
         self.assertNotEqual(keyboard.close_thread, threading.get_ident())
         self.assertEqual(self.window.last_report['keyboard']['status'], 'closed')
+
+    def test_usb_keyboard_starts_after_streaming_without_blocking_video(self):
+        self.initial_status = 'idle'
+        create_client = desktop.create_client
+        class USBDesktopClient:
+            # The GUI sees a USB connection. The real loopback client's decoder
+            # retains TCP framing, so this tests lifecycle without fake USB IO.
+            backend = 'DIRECT_USB_AOA'
+            def __init__(self, client):
+                self.client = client
+            def __getattr__(self, name):
+                return getattr(self.client, name)
+        def create(*args, **kwargs):
+            return USBDesktopClient(create_client(*args, **kwargs))
+        with patch.object(desktop, 'create_client', side_effect=create):
+            client, peer = self.start_demo()
+        keyboard = self.created[-1]
+        self.wait_for(lambda: keyboard.start_thread is not None)
+        self.assertEqual(keyboard.start_state, 'STREAMING')
+        self.assertNotEqual(keyboard.start_thread, threading.get_ident())
+        self.assertFalse(self.window.busy)
+        self.assertTrue(self.window.keyboard_start_requested)
+        before = client.decoded_frames
+        self.wait_for(lambda: client.decoded_frames >= before + 2)
+        self.assertIsNone(client.error)
+        self.assertIsNone(peer.error)
 
     def test_optional_hid_failure_keeps_video_and_navigation_working(self):
         self.initial_status = 'failed'

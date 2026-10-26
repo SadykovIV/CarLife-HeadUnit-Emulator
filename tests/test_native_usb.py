@@ -187,6 +187,43 @@ class NativeUSBTests(unittest.TestCase):
         with self.assertRaises(OSError):
             stream.sendall(b"version")
 
+    def test_writer_failure_remains_primary_when_cancelled_reader_wins_guard(self):
+        cancel = threading.Event()
+        observed_workers = []
+        def read(capacity, timeout):
+            if not cancel.wait(2):
+                raise AssertionError("writer did not cancel the reader")
+            raise InterruptedError("USB read cancelled")
+        def write(data, timeout):
+            raise TimeoutError("USB write deadline after 0/20 bytes")
+        def observe(stage, **details):
+            if stage == "usb_first_write_failed":
+                # Hold the writer outside _guard so the cancelled reader is
+                # deterministically the first worker to report the failure.
+                if not client.halt.wait(2):
+                    raise AssertionError("reader did not record the failure")
+                observed_workers.append(threading.current_thread().name)
+        handle = SimpleNamespace(read=read, write=write, cancel=cancel, close=cancel.set)
+        stream = USBStream(SimpleNamespace(close=lambda: None), handle,
+                           open(self.root / "failure-lock", "a+"), {}, observer=observe)
+        client = HUClient("direct-usb", 0, self.root / "write-failure",
+                          backend="DIRECT_USB_AOA", transport_factory=lambda: stream)
+        try:
+            client.start()
+            self.assertTrue(client.halt.wait(3))
+            client.stop()
+            self.assertEqual(client.error, "TimeoutError: USB write deadline after 0/20 bytes")
+            self.assertEqual(stream.failure_reason, client.error)
+            self.assertEqual(observed_workers, ["carlife-writer"])
+            records = [json.loads(line) for line in (client.output_dir / "trace.jsonl").read_text().splitlines()]
+            failure = next(item for item in records if item.get("event") == "error")
+            self.assertEqual(failure["worker"], "carlife-reader")
+            self.assertEqual(failure["observed_error"], "InterruptedError: USB read cancelled")
+            self.assertEqual(failure["error"], client.error)
+        finally:
+            client.stop()
+            stream.close()
+
     def fake_factory(self, *, accessory=False, start_error=False):
         parent = self
         state = {"accessory": accessory, "starts": 0, "claims": [], "closed": 0, "opened": []}
@@ -199,6 +236,7 @@ class NativeUSBTests(unittest.TestCase):
             def start_accessory(self, strings, admission, observer=None):
                 admission.require(self.identity)
                 state["starts"] += 1
+                state["accessory_strings"] = strings
                 if start_error: raise OSError("unknown control result")
                 state["accessory"] = True
                 if observer: observer("aoa_request_complete", request=53)
@@ -237,6 +275,19 @@ class NativeUSBTests(unittest.TestCase):
         self.assertEqual(state["starts"], 1)
         self.assertEqual(state["claims"], [0, 0])
         self.assertEqual(state["closed"], 2)
+
+    def test_aoa_identity_matches_android_carlife_application_filters(self):
+        factory, state = self.fake_factory()
+        stream = factory()
+        try:
+            manufacturer, model, description, version, uri, serial = state["accessory_strings"]
+            # HeadSwap matches manufacturer/model; CarProjection additionally
+            # requires version 1.0.0 in its USB_ACCESSORY_ATTACHED filter.
+            self.assertEqual((manufacturer, model), ("Baidu", "CarLife"))
+            self.assertEqual(version, "1.0.0")
+            self.assertEqual(stream.evidence["aoa_version"], 2)
+        finally:
+            stream.close()
 
     def test_unknown_start_outcome_never_retries(self):
         factory, state = self.fake_factory(start_error=True)

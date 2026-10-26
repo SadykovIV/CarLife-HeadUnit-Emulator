@@ -24,15 +24,19 @@ def wait_for(predicate, timeout=2):
 
 
 class FakeHandle:
-    def __init__(self, protocol=2, maximum=64):
-        self.protocol = protocol
+    def __init__(self, maximum=64):
         self.descriptor = {'endpoint0_max_packet': maximum}
         self.calls = []
         self.hook = None
+        self.cancel = threading.Event()
+        self.closed = False
 
     def get_protocol(self):
-        self.calls.append((51, 0, 0, b''))
-        return self.protocol
+        raise AssertionError('GET_PROTOCOL must not reset an active accessory identity')
+
+    def close(self):
+        self.closed = True
+        self.cancel.set()
 
     def hid_control(self, request, hid_id, *, index=0, data=b''):
         self.calls.append((request, hid_id, index, data))
@@ -88,26 +92,34 @@ class KeyboardWorkerTests(unittest.TestCase):
 
     def test_register_descriptor_chunks_release_and_unregister(self):
         keyboard, handle = self.keyboard(FakeHandle(maximum=8))
-        self.assertTrue(keyboard.start()['available'])
-        self.assertEqual(handle.calls[0], (51, 0, 0, b''))
-        self.assertEqual(handle.calls[1], (54, 0x434c, len(KEYBOARD_REPORT_DESCRIPTOR), b''))
+        state = keyboard.start()
+        self.assertTrue(state['available'])
+        self.assertTrue(state['descriptor_ready'])
+        self.assertEqual(state['aoa_protocol'], 2)
+        self.assertEqual(handle.calls[0], (54, 1, len(KEYBOARD_REPORT_DESCRIPTOR), b''))
         chunks = [call for call in handle.calls if call[0] == 56]
         self.assertEqual([c[2] for c in chunks], list(range(0, len(KEYBOARD_REPORT_DESCRIPTOR), 8)))
         self.assertEqual(b''.join(c[3] for c in chunks), KEYBOARD_REPORT_DESCRIPTOR)
         self.assertTrue(all(len(c[3]) <= 8 for c in chunks))
-        self.assertEqual(handle.calls[-1], (57, 0x434c, 0, RELEASE_REPORT))
+        self.assertEqual(handle.calls[-1], (57, 1, 0, RELEASE_REPORT))
         keyboard.close()
-        self.assertEqual(handle.calls[-1], (55, 0x434c, 0, b''))
+        self.assertEqual(handle.calls[-1], (55, 1, 0, b''))
         count = len(handle.calls)
         keyboard.close()
         self.assertEqual(len(handle.calls), count)
         self.assertFalse(keyboard.snapshot()['worker_alive'])
         self.assertFalse(keyboard.snapshot()['registered'])
+        self.assertFalse(keyboard.snapshot()['descriptor_ready'])
 
     def test_aoa1_and_tcp_are_explicitly_unavailable_without_register(self):
-        keyboard, handle = self.keyboard(FakeHandle(protocol=1))
+        handle = FakeHandle()
+        client = SimpleNamespace(backend='DIRECT_USB_AOA',
+            sock=SimpleNamespace(handle=handle, evidence={'aoa_version': 1}))
+        keyboard = HIDKeyboard.for_client(client)
+        self.addCleanup(keyboard.close)
         self.assertEqual(keyboard.start()['status'], 'unavailable')
-        self.assertEqual([call[0] for call in handle.calls], [51])
+        self.assertEqual(keyboard.snapshot()['aoa_protocol'], 1)
+        self.assertEqual(handle.calls, [])
         with self.assertRaises(KeyboardInputError):
             keyboard.submit_text('no')
         client = SimpleNamespace(backend='TCP_STREAM', sock=object())
@@ -123,6 +135,96 @@ class KeyboardWorkerTests(unittest.TestCase):
         self.addCleanup(keyboard.close)
         self.assertIs(keyboard.handle, handle)
         self.assertEqual(handle.calls, [])
+        self.assertIsNone(keyboard.snapshot()['aoa_protocol'])
+        self.assertTrue(keyboard.start()['available'])
+        self.assertEqual(keyboard.snapshot()['aoa_protocol'], 2)
+
+    def test_captured_aoa2_is_used_without_another_get_protocol(self):
+        handle = FakeHandle()
+        client = SimpleNamespace(backend='DIRECT_USB_AOA',
+            sock=SimpleNamespace(handle=handle, evidence={'aoa_version': 2}))
+        keyboard = HIDKeyboard.for_client(client)
+        self.addCleanup(keyboard.close)
+        self.assertEqual(keyboard.snapshot()['aoa_protocol'], 2)
+        self.assertTrue(keyboard.start()['available'])
+        self.assertEqual(handle.calls[0][0], 54)
+
+    def test_initialization_reports_starting_without_blocking_status_reads(self):
+        keyboard, handle = self.keyboard()
+        entered, release = threading.Event(), threading.Event()
+        def hook(request, _data):
+            if request == 54:
+                entered.set()
+                if not release.wait(2):
+                    raise RuntimeError('test register timeout')
+        handle.hook = hook
+        initializer = threading.Thread(target=keyboard.start)
+        initializer.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            state = keyboard.snapshot()
+            self.assertEqual(state['status'], 'starting')
+            self.assertFalse(state['available'])
+            self.assertFalse(state['registered'])
+            self.assertFalse(state['worker_alive'])
+        finally:
+            release.set()
+            initializer.join(1)
+        self.assertFalse(initializer.is_alive())
+        self.assertTrue(keyboard.snapshot()['available'])
+
+    def test_hid_ids_fit_android_accessory_driver_limit(self):
+        for hid_id in (1, 32):
+            with self.subTest(hid_id=hid_id):
+                handle = FakeHandle()
+                keyboard = HIDKeyboard(handle, hid_id=hid_id)
+                try:
+                    self.assertTrue(keyboard.start()['available'])
+                    self.assertEqual({call[1] for call in handle.calls}, {hid_id})
+                finally:
+                    keyboard.close()
+        for hid_id in (0, -1, 33, 0x434c, 65535, True, '1'):
+            with self.subTest(hid_id=hid_id), self.assertRaises(ValueError):
+                HIDKeyboard(FakeHandle(), hid_id=hid_id)
+
+    def test_rejected_register_does_not_send_release_unregister_or_cancel_bulk(self):
+        keyboard, handle = self.keyboard()
+        def hook(request, _data):
+            if request == 54:
+                raise USBError('register rejected', -9)
+        handle.hook = hook
+        state = keyboard.start()
+        self.assertEqual(state['status'], 'failed')
+        self.assertIn('PIPE', state['error'])
+        self.assertEqual(state['cleanup_errors'], [])
+        self.assertFalse(state['registered'])
+        self.assertFalse(state['registration_uncertain'])
+        self.assertFalse(state['descriptor_ready'])
+        self.assertEqual([call[0] for call in handle.calls], [54])
+        closed = keyboard.close()
+        self.assertEqual(closed['cleanup_errors'], [])
+        self.assertEqual(closed['error'], state['error'])
+        self.assertEqual([call[0] for call in handle.calls], [54])
+        self.assertFalse(handle.cancel.is_set())
+        self.assertFalse(handle.closed)
+
+    def test_ambiguous_register_timeout_unregisters_once_without_release_or_replay(self):
+        keyboard, handle = self.keyboard()
+        def hook(request, _data):
+            if request == 54:
+                raise USBError('register result unknown', -7)
+        handle.hook = hook
+        state = keyboard.start()
+        self.assertEqual(state['status'], 'failed')
+        self.assertIn('TIMEOUT', state['error'])
+        self.assertFalse(state['registered'])
+        self.assertFalse(state['registration_uncertain'])
+        self.assertFalse(state['descriptor_ready'])
+        self.assertEqual([call[0] for call in handle.calls], [54, 55])
+        keyboard.close()
+        self.assertEqual([call[0] for call in handle.calls], [54, 55])
+        self.assertFalse(handle.cancel.is_set())
+        self.assertFalse(handle.closed)
 
     def test_failed_descriptor_unregisters_and_does_not_close_shared_handle(self):
         keyboard, handle = self.keyboard()
@@ -133,8 +235,74 @@ class KeyboardWorkerTests(unittest.TestCase):
         result = keyboard.start()
         self.assertEqual(result['status'], 'failed')
         self.assertFalse(result['registered'])
-        self.assertEqual(handle.calls[-1][0], 55)
+        self.assertFalse(result['descriptor_ready'])
+        self.assertEqual([call[0] for call in handle.calls], [54, 56, 55])
         self.assertFalse(result['worker_alive'])
+        self.assertFalse(handle.cancel.is_set())
+        self.assertFalse(handle.closed)
+
+    def test_unregister_failure_is_separate_from_primary_descriptor_failure(self):
+        keyboard, handle = self.keyboard()
+        def hook(request, _data):
+            if request == 56:
+                raise USBError('descriptor rejected', -9)
+            if request == 55:
+                raise USBError('unregister timed out', -7)
+        handle.hook = hook
+        state = keyboard.start()
+        self.assertEqual(state['error'], 'USBError: descriptor rejected: libusb PIPE')
+        self.assertEqual(state['cleanup_errors'], ['unregister: USBError: unregister timed out: libusb TIMEOUT'])
+        self.assertEqual(keyboard.close()['cleanup_errors'], state['cleanup_errors'])
+        self.assertEqual([call[0] for call in handle.calls], [54, 56, 55])
+        # Callers cannot mutate the retained cleanup evidence via a snapshot.
+        state['cleanup_errors'].clear()
+        self.assertEqual(len(keyboard.snapshot()['cleanup_errors']), 1)
+
+    def test_normal_close_records_unregister_failure_as_cleanup_error(self):
+        keyboard, handle = self.keyboard()
+        self.assertTrue(keyboard.start()['available'])
+        def hook(request, _data):
+            if request == 55:
+                raise USBError('unregister rejected', -9)
+        handle.hook = hook
+        state = keyboard.close()
+        self.assertEqual(state['status'], 'failed')
+        self.assertFalse(state['worker_alive'])
+        self.assertEqual(state['cleanup_errors'], ['unregister: USBError: unregister rejected: libusb PIPE'])
+        self.assertEqual(state['error'], state['cleanup_errors'][0])
+        self.assertFalse(handle.cancel.is_set())
+        self.assertFalse(handle.closed)
+
+    def test_join_failure_is_cleanup_evidence_without_replacing_primary_error(self):
+        keyboard, handle = self.keyboard()
+        keyboard.status = 'failed'
+        keyboard.error = 'primary input failure'
+        keyboard.worker = SimpleNamespace(join=lambda **kwargs: None, is_alive=lambda: True)
+        try:
+            state = keyboard.close()
+            self.assertTrue(state['worker_alive'])
+            self.assertEqual(state['error'], 'primary input failure')
+            self.assertEqual(state['cleanup_errors'], ['Keyboard worker did not stop within its bounded timeout'])
+            self.assertEqual(keyboard.close()['cleanup_errors'], state['cleanup_errors'])
+        finally:
+            keyboard.worker = None
+
+    def test_incomplete_descriptor_unregisters_without_sending_a_hid_report(self):
+        keyboard, handle = self.keyboard(FakeHandle(maximum=8))
+        chunks = []
+        def hook(request, data):
+            if request == 56:
+                chunks.append(data)
+                if len(chunks) == 2:
+                    raise USBError('descriptor tail timed out', -7)
+        handle.hook = hook
+        state = keyboard.start()
+        self.assertEqual(state['status'], 'failed')
+        self.assertEqual([call[0] for call in handle.calls], [54, 56, 56, 55])
+        self.assertEqual(chunks[0], KEYBOARD_REPORT_DESCRIPTOR[:8])
+        self.assertFalse(state['descriptor_ready'])
+        self.assertFalse(handle.cancel.is_set())
+        self.assertFalse(handle.closed)
 
     def test_worker_launch_failure_unregisters_and_remains_safe_to_close(self):
         keyboard, handle = self.keyboard()
@@ -262,8 +430,8 @@ class USBControlTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'not claimed'):
             handle.hid_control(54, 4)
         handle.pair = SimpleNamespace(interface=0)
-        handle.hid_control(56, 0x434c, index=8, data=b'fixture')
-        self.assertEqual(calls, [(0x40, 56, 0x434c, 8, b'fixture', 200)])
+        handle.hid_control(56, 4, index=8, data=b'fixture')
+        self.assertEqual(calls, [(0x40, 56, 4, 8, b'fixture', 200)])
         with self.assertRaises(ValueError):
             handle.hid_control(53, 0)
         handle.close()

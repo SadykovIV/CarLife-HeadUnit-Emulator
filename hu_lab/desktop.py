@@ -349,6 +349,8 @@ class HeadUnitWindow(QMainWindow):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.client = self.demo = None
         self.keyboard = None
+        self.keyboard_start_future = None
+        self.keyboard_start_requested = False
         self.last_keyboard_status = None
         self.ingress = None
         self.last_run = None
@@ -751,6 +753,9 @@ class HeadUnitWindow(QMainWindow):
             status = self.keyboard.snapshot()
             if status['available']:
                 text = f'USB-клавиатура готова · отправлено {status["sent_keys"]} · в очереди {status["pending_keys"]}'
+            elif status['status'] in ('idle', 'starting') and self.client and self.client.backend == 'DIRECT_USB_AOA':
+                text = ('USB-клавиатура подключается…' if self.keyboard_start_requested else
+                        'USB-клавиатура ожидает запуска CarLife.')
             elif status['status'] == 'failed':
                 text = 'USB-клавиатура недоступна: ' + str(status['error'] or status['reason'])
             elif self.client and self.client.backend != 'DIRECT_USB_AOA':
@@ -934,7 +939,10 @@ class HeadUnitWindow(QMainWindow):
                                        on_frame_available=self.frame_wake.notify)
                 client.start()
                 keyboard = HIDKeyboard.for_client(client) if hid_enabled else HIDKeyboard(unavailable_reason='USB-клавиатура отключена в настройках')
-                keyboard.start()
+                # Optional HID must not issue control requests while Android
+                # is opening the accessory and negotiating the CarLife stream.
+                if not hid_enabled or client.backend != 'DIRECT_USB_AOA':
+                    keyboard.start()
                 return client, peer, keyboard
             except Exception:
                 ingress.close()
@@ -947,6 +955,8 @@ class HeadUnitWindow(QMainWindow):
                 raise
         def done(result):
             self.client, self.demo, self.keyboard = result
+            self.keyboard_start_future = None
+            self.keyboard_start_requested = False
             self.last_keyboard_status = None
             self.update_keyboard_status()
             if config.transport == 'usb':
@@ -962,6 +972,21 @@ class HeadUnitWindow(QMainWindow):
             self.log_event(f'Сессия: {output.name}')
             if self.closing: self.disconnect_session()
         self.submit(work,done)
+
+    def start_keyboard_when_ready(self):
+        client, keyboard = self.client, self.keyboard
+        if (self.keyboard_start_requested or not client or not keyboard or
+                client.backend != 'DIRECT_USB_AOA' or client.session.state != 'STREAMING' or
+                client.halt.is_set() or client.stopped or self.closing or
+                keyboard.snapshot()['status'] != 'idle'):
+            return
+        self.keyboard_start_requested = True
+        def work():
+            if not client.halt.is_set() and not client.stopped:
+                return keyboard.start()
+        # The same single worker serializes startup with disconnect/close, but
+        # HID initialization does not mark the video/UI busy.
+        self.keyboard_start_future = self.executor.submit(work)
 
     def disconnect_session(self, after=None):
         if isinstance(after,bool): after = None
@@ -983,8 +1008,8 @@ class HeadUnitWindow(QMainWindow):
             if keyboard:
                 try:
                     stopped_keyboard = keyboard.close()
-                    if stopped_keyboard.get('worker_alive') or stopped_keyboard.get('error'):
-                        cleanup_errors.append('Keyboard: ' + str(stopped_keyboard.get('error') or 'worker did not stop'))
+                    if stopped_keyboard.get('worker_alive') or stopped_keyboard.get('cleanup_errors'):
+                        cleanup_errors.append('Keyboard: ' + str(stopped_keyboard.get('cleanup_errors') or 'worker did not stop'))
                 except Exception as error:
                     cleanup_errors.append(f'Keyboard stop: {error}')
             try:
@@ -1016,6 +1041,8 @@ class HeadUnitWindow(QMainWindow):
             self.history.append({'session_id':report['session_id'],'error':report['error'],'demo':report['demo']})
             self.client = self.demo = None
             self.keyboard = None
+            self.keyboard_start_future = None
+            self.keyboard_start_requested = False
             self.last_keyboard_status = None
             self.update_keyboard_status()
             self.activity.close()
@@ -1120,6 +1147,13 @@ class HeadUnitWindow(QMainWindow):
                 self.video.clear()
 
     def tick(self):
+        if self.keyboard_start_future and self.keyboard_start_future.done():
+            future, self.keyboard_start_future = self.keyboard_start_future, None
+            try:
+                future.result()
+            except Exception as error:
+                self.log_event(f'Клавиатура: {type(error).__name__}: {error}')
+            self.update_keyboard_status()
         for future, done in list(self.pending):
             if future.done():
                 self.pending.remove((future,done)); self.busy = False
@@ -1156,6 +1190,7 @@ class HeadUnitWindow(QMainWindow):
                 if client.error: self.show_error(client.error)
                 self.disconnect_session()
                 return
+            self.start_keyboard_when_ready()
             self.refresh_frame()
             if self.gesture_frames and time.monotonic() >= self.gesture_due:
                 f = self.gesture_frames.pop(0)

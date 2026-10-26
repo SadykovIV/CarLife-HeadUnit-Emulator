@@ -511,7 +511,9 @@ class HUClient:
             with self.failure_lock:
                 first_failure = not self.halt.is_set()
                 if first_failure:
-                    self.error = f"{type(error).__name__}: {error}"
+                    origin = getattr(self.sock, "failure_reason", None)
+                    self.error = (origin if isinstance(error, InterruptedError) and origin
+                                  else f"{type(error).__name__}: {error}")
                     if self.session.state != "BLOCKED_AUTH":
                         self.session.state = "ERROR"
                     self.halt.set()
@@ -526,6 +528,7 @@ class HUClient:
                     self.media.close()
             if first_failure:
                 self.trace.event("error", worker=threading.current_thread().name, error=self.error,
+                                 observed_error=f"{type(error).__name__}: {error}",
                                  queue_evidence=getattr(error, "evidence", self.media.snapshot()),
                                  active_pipeline_stages=dict(self.pipeline_stages), socket_shutdown=True,
                                  recent_progress=list(self.progress_history),
