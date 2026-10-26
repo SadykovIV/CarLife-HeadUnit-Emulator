@@ -63,3 +63,9 @@ jobs:
       - name: Run unit and loopback integration tests
         # USB is mocked; DemoPeer uses localhost and generated video/audio.
         run: python -m unittest discover -s tests -v
+
+      - name: Diagnose a failed test process
+        if: failure()
+        # Keep failures visible; isolated child exit codes identify whether a
+        # native shutdown failure is local to one module or shared Qt state.
+        run: python .github/diagnose_tests.py
