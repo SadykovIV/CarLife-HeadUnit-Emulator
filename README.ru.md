@@ -56,16 +56,18 @@ open "CarLife HeadUnit Emulator.app" --args --demo
 
 ## Запуск из исходников
 
-Используйте Python 3.11+ и установите desktop-зависимости, чтобы были доступны видео и тесты Qt. Из корня репозитория на macOS/Linux:
+Используйте Python 3.13 и установите desktop-зависимости, чтобы были доступны видео и тесты Qt. Из корня репозитория на macOS/Linux:
 
 ```sh
-python3 -m venv .venv
+python3.13 -m venv .venv
 . .venv/bin/activate
 python -m pip install -r requirements-hu.txt
 python -m hu_lab.desktop --demo
 ```
 
-На Windows создайте среду командой `py -3 -m venv .venv`, активируйте `.\.venv\Scripts\Activate.ps1`, затем выполните те же команды `python -m pip` и `python -m hu_lab.desktop`. Для настоящего USB дополнительно нужна нативная библиотека libusb; демо не открывает USB. В готовых пакетах libusb уже есть.
+На Windows создайте среду командой `py -3.13 -m venv .venv`, активируйте `.\.venv\Scripts\Activate.ps1`, затем выполните те же команды `python -m pip` и `python -m hu_lab.desktop`. Для настоящего USB дополнительно нужна нативная библиотека libusb; демо не открывает USB. В готовых пакетах libusb уже есть.
+
+Для Linux с закреплёнными зависимостями используйте Python 3.13. У Linux wheel PySide6 6.12.0 обнаружена ошибка подсчёта ссылок сигналов на Python 3.11; она воспроизводится без кода приложения. Упакованное окружение macOS проверено отдельно. Причина связана с [исправлением limited ABI в CPython](https://github.com/python/cpython/commit/9258f3da9175134d03f2c8c7c7eed223802ad945).
 
 ## Сборка
 

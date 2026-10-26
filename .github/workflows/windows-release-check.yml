@@ -1,0 +1,157 @@
+name: Windows packaged release check
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag whose Windows ZIP should be tested
+        required: true
+        default: v0.3.1
+        type: string
+      expected_sha256:
+        description: Expected SHA256 of the complete Windows ZIP
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  windows-package:
+    name: Windows 2025 / packaged x64 runtime
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      # Draft releases are visible only to push-authorized identities. This
+      # manual workflow only reads release assets; it never edits a release.
+      # https://docs.github.com/en/rest/releases/releases#list-releases
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+
+    steps:
+      - name: Validate inputs and prepare isolated directories
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          if ($env:RELEASE_TAG -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw 'Tag must have the form vX.Y.Z.'
+          }
+          if ($env:EXPECTED_SHA256 -notmatch '^[0-9a-fA-F]{64}$') {
+            throw 'Expected SHA256 must be exactly 64 hexadecimal characters.'
+          }
+          $version = $env:RELEASE_TAG.Substring(1)
+          $name = "CarLife-HeadUnit-Emulator-$version-Windows-x64"
+          $work = Join-Path $env:RUNNER_TEMP 'headunit-release-check'
+          $smoke = Join-Path $env:RUNNER_TEMP 'headunit-smoke'
+          New-Item -ItemType Directory -Path "$work/download", "$work/unpacked", "$work/logs", "$work/temp", "$work/localappdata", $smoke | Out-Null
+          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+          "ASSET_NAME=$name.zip" >> $env:GITHUB_ENV
+          "CHECK_ROOT=$work" >> $env:GITHUB_ENV
+          "PACKAGE_ROOT=$work/unpacked/$name" >> $env:GITHUB_ENV
+          "SMOKE_ROOT=$smoke" >> $env:GITHUB_ENV
+
+      - name: Download draft asset, verify SHA256 and extract the whole package
+        timeout-minutes: 3
+        env:
+          # Keep the token out of the application process environment.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          Set-StrictMode -Version Latest
+          & gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern $env:ASSET_NAME --dir "$env:CHECK_ROOT/download"
+          if ($LASTEXITCODE -ne 0) { throw "Release download failed: exit $LASTEXITCODE" }
+          $archive = Join-Path "$env:CHECK_ROOT/download" $env:ASSET_NAME
+          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -cne $env:EXPECTED_SHA256.ToLowerInvariant()) {
+            throw "SHA256 mismatch: expected $env:EXPECTED_SHA256, got $actual"
+          }
+          "Asset: $env:ASSET_NAME`nSHA256: $actual" | Set-Content "$env:CHECK_ROOT/logs/asset.log" -Encoding utf8
+          Expand-Archive -LiteralPath $archive -DestinationPath "$env:CHECK_ROOT/unpacked"
+          foreach ($relative in @('CarLifeHeadUnitEmulator.exe', 'Verify.cmd', 'runtime/pythonw.exe', 'build-info.json')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $env:PACKAGE_ROOT $relative) -PathType Leaf)) {
+              throw "Missing package file: $relative"
+            }
+          }
+          $build = Get-Content -LiteralPath "$env:PACKAGE_ROOT/build-info.json" -Raw | ConvertFrom-Json
+          if ($build.version -ne $env:RELEASE_VERSION -or $build.architecture -ne 'x64') {
+            throw 'The packaged version or architecture does not match the requested release.'
+          }
+
+      - name: Run Verify.cmd with the bundled interpreter and DLLs
+        # Start-Process -Wait waits for the launcher and its Python child.
+        # The step timeout bounds the entire process tree if either hangs.
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $env:TEMP = "$env:CHECK_ROOT/temp"
+          $env:TMP = $env:TEMP
+          $env:LOCALAPPDATA = "$env:CHECK_ROOT/localappdata"
+          try {
+            $process = Start-Process -FilePath $env:ComSpec -ArgumentList '/d /s /c Verify.cmd' -WorkingDirectory $env:PACKAGE_ROOT -Wait -PassThru -RedirectStandardOutput "$env:CHECK_ROOT/logs/verify.stdout.log" -RedirectStandardError "$env:CHECK_ROOT/logs/verify.stderr.log"
+            if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) {
+              throw "Verify.cmd failed: exit $($process.ExitCode)"
+            }
+            $check = Get-Content -LiteralPath "$env:TEMP/carlife-bundle-check.json" -Raw | ConvertFrom-Json
+            if ($check.status -ne 'PASS' -or $check.platform -ne 'win32' -or $check.portable -ne $true -or $check.architecture -notmatch '^(AMD64|x86_64)$') {
+              throw 'Packaged Windows import/native-library verification failed.'
+            }
+            if ($check.h264_decoder -ne 'available' -or $check.demo_encoder -ne 'libx264') {
+              throw 'Required H.264 decoder or demo encoder is unavailable.'
+            }
+          } finally {
+            $startup = Join-Path $env:LOCALAPPDATA 'CarLife HeadUnit/startup-error.txt'
+            if (Test-Path -LiteralPath $startup) {
+              Copy-Item -LiteralPath $startup -Destination "$env:CHECK_ROOT/logs/verify-startup.log"
+            }
+          }
+
+      - name: Run the packaged GUI demo and require clean shutdown
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $env:TEMP = "$env:CHECK_ROOT/temp"
+          $env:TMP = $env:TEMP
+          $env:LOCALAPPDATA = "$env:CHECK_ROOT/localappdata"
+          Remove-Item Env:QT_QPA_PLATFORM -ErrorAction SilentlyContinue
+          $arguments = "--demo --smoke-test 8 --data-dir `"$env:SMOKE_ROOT`""
+          try {
+            $process = Start-Process -FilePath "$env:PACKAGE_ROOT/CarLifeHeadUnitEmulator.exe" -ArgumentList $arguments -WorkingDirectory $env:PACKAGE_ROOT -Wait -PassThru -RedirectStandardOutput "$env:CHECK_ROOT/logs/demo.stdout.log" -RedirectStandardError "$env:CHECK_ROOT/logs/demo.stderr.log"
+            if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) {
+              throw "Packaged GUI demo failed: exit $($process.ExitCode)"
+            }
+            $report = Get-Content -LiteralPath "$env:SMOKE_ROOT/smoke-report.json" -Raw | ConvertFrom-Json
+            if ($report.version -ne $env:RELEASE_VERSION -or $report.decoded_frames -le 0) {
+              throw 'The requested version did not decode demo frames.'
+            }
+            if ($report.error -or $report.demo_error -or @($report.workers_alive).Count -ne 0 -or @($report.desktop_cleanup_errors).Count -ne 0) {
+              throw 'The demo reported an error or did not stop all workers cleanly.'
+            }
+            if (-not (Test-Path -LiteralPath "$env:SMOKE_ROOT/smoke-window.png" -PathType Leaf)) {
+              throw 'The packaged GUI did not create its smoke screenshot.'
+            }
+            "Windows packaged demo PASS: $($report.decoded_frames) frames; clean exit 0." | Tee-Object -FilePath "$env:CHECK_ROOT/logs/result.log"
+          } finally {
+            $startup = Join-Path $env:LOCALAPPDATA 'CarLife HeadUnit/startup-error.txt'
+            if (Test-Path -LiteralPath $startup) {
+              Copy-Item -LiteralPath $startup -Destination "$env:CHECK_ROOT/logs/demo-startup.log"
+            }
+          }
+
+      - name: Upload only this run's smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-packaged-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/headunit-smoke/smoke-report.json
+            ${{ runner.temp }}/headunit-smoke/smoke-window.png
+            ${{ runner.temp }}/headunit-release-check/logs/*.log

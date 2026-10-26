@@ -395,6 +395,9 @@ class HUClient:
         self._sps_prefix = bytearray()
         self.state_lock = threading.RLock()
         self.reference_gate = ReferenceStartGate()
+        self.resume_recovery = None
+        self.resume_discarded_aus = self.resume_discarded_bytes = 0
+        self.resume_pts_restarts = 0
         self.old_generation_chunks_dropped = 0
         self.generation_frames = {}
         self.video_packetization = "ANNEXB_STREAM_CHUNKS"
@@ -563,6 +566,7 @@ class HUClient:
         with nullcontext(None) as video:
             while not self.halt.is_set():
                 self._check_native_handshake_deadline()
+                self._resume_recovery_window()
                 if self._native_rx_boundary_ready(len(parser.buffer)):
                     # Signal only between reads at a complete frame boundary.
                     # Returning prevents a new partial read racing host close.
@@ -666,16 +670,42 @@ class HUClient:
                     kinds = [kind for kind, body in nals]
                     if not any(kind in (1, 5) for kind in kinds):
                         raise ProtocolError("negotiated complete AU contains no VCL picture")
+                    recovery = self._resume_recovery_window(len(packet.payload))
+                    independent = all(kind in kinds for kind in (7, 8, 5))
                     if not self.reference_gate.ready:
-                        if not all(kind in kinds for kind in (7, 8, 5)):
+                        if not independent:
+                            if recovery is not None:
+                                self.resume_discarded_aus += 1
+                                self.resume_discarded_bytes += len(packet.payload)
+                                self.old_generation_chunks_dropped += 1
+                                self.trace.event("resume_inflight_au_discarded", bytes=len(packet.payload),
+                                                 nal_types=kinds, generation=self.decoder_generation,
+                                                 window_bytes=recovery["bytes"],
+                                                 maximum_bytes=recovery["maximum_bytes"])
+                                return
                             raise ProtocolError("first complete AU requires unaltered SPS/PPS and IDR")
                         self.reference_gate.ready = True
-                    self._inspect_sps(packet.payload)
                     raw = packet.timestamp
                     previous = self.pts_epochs.get(self.decoder_generation)
                     unwrapped = raw if previous is None else previous + ((raw - (previous & 0xFFFFFFFF)) & 0xFFFFFFFF)
                     if previous is not None and unwrapped - previous > 0x7FFFFFFF:
-                        raise ProtocolError("encoder PTS moved backwards in an AU generation")
+                        if recovery is None or recovery["pts_restart_used"] or not independent:
+                            raise ProtocolError("encoder PTS moved backwards in an AU generation")
+                        # START has no generation ID/ack. An old independently
+                        # decodable IDR can precede the restarted encoder's IDR.
+                        # Permit one header-proven restart inside this explicit,
+                        # bounded resume window; dependent/backwards AUs fail.
+                        self._new_generation("resume_encoder_pts_restart")
+                        recovery["pts_restart_used"] = True
+                        self.resume_recovery = recovery
+                        self.resume_pts_restarts += 1
+                        self.reference_gate.ready = True
+                        unwrapped = raw
+                        self.trace.event("resume_encoder_pts_restart", previous_pts_ms=previous,
+                                         pts_ms=raw, generation=self.decoder_generation,
+                                         nal_types=kinds, window_bytes=recovery["bytes"],
+                                         maximum_bytes=recovery["maximum_bytes"])
+                    self._inspect_sps(packet.payload)
                     self.pts_epochs[self.decoder_generation] = unwrapped
                     with self.metrics_lock:
                         self.total_aus += 1
@@ -1084,9 +1114,31 @@ class HUClient:
                 self.cancel_touch("pause")
             self.send(self.session.pause())
             self.media.clear()
+            self.resume_recovery = None
+
+    def _resume_recovery_window(self, received_bytes=0):
+        """Bound post-resume transport tails without weakening initial startup."""
+        with self.state_lock:
+            recovery = self.resume_recovery
+            if recovery is None:
+                return None
+            reason = ("deadline" if time.monotonic() >= recovery["deadline"] else
+                      "byte_limit" if recovery["bytes"] + received_bytes > recovery["maximum_bytes"] else None)
+            if reason:
+                self.resume_recovery = None
+                self.trace.event("resume_recovery_window_closed", reason=reason,
+                                 bytes=recovery["bytes"], maximum_bytes=recovery["maximum_bytes"],
+                                 deadline_seconds=8, reference_ready=self.reference_gate.ready,
+                                 pts_restart_used=recovery["pts_restart_used"])
+                if not self.reference_gate.ready:
+                    raise ProtocolError("resume SPS/PPS/IDR wait exceeded " + reason)
+                return None
+            recovery["bytes"] += received_bytes
+            return recovery
 
     def _new_generation(self, reason):
         self.decoder_generation += 1
+        self.resume_recovery = None
         discarded = self.media.clear()
         self.reference_gate = ReferenceStartGate()
         with self.frame_lock:
@@ -1100,7 +1152,14 @@ class HUClient:
     def resume(self):
         with self.state_lock:
             packet = self.session.resume()
+            recover = self.video_packetization == "ANNEXB_COMPLETE_AU" and self.total_aus > 0
             self._new_generation("resume")
+            if recover:
+                self.resume_recovery = {"deadline": time.monotonic() + 8, "bytes": 0,
+                                        "maximum_bytes": 4 * 1024 * 1024, "pts_restart_used": False}
+                self.trace.event("resume_recovery_window_opened", deadline_seconds=8,
+                                 maximum_bytes=4 * 1024 * 1024, generation=self.decoder_generation,
+                                 reason="in-flight media before unacknowledged VIDEO_START")
             self.send(packet)
 
     def reset(self):
@@ -1154,6 +1213,11 @@ class HUClient:
                 "unknown_messages": self.session.unknown, "duplicate_messages": self.session.duplicates,
                 "md_info": self.session.md_info, "sps": self.sps, "sps_validation": self.sps_validation,
                 "decoder_generation": self.decoder_generation,
+                "resume_recovery": {"active": self.resume_recovery is not None,
+                                    "discarded_aus": self.resume_discarded_aus,
+                                    "discarded_bytes": self.resume_discarded_bytes,
+                                    "pts_restarts": self.resume_pts_restarts,
+                                    "deadline_seconds": 8, "maximum_bytes": 4 * 1024 * 1024},
                 "generation_frames": self.generation_frames,
                 "old_generation_chunks_dropped": self.old_generation_chunks_dropped,
                 "workers_alive": [t.name for t in self.threads + ([self.png_thread] if self.png_thread else []) + [self.trace.writer] if t.is_alive()]}

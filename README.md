@@ -56,16 +56,18 @@ Paste sends local clipboard text as physical key presses **from the computer to 
 
 ## Run from source
 
-Use Python 3.11+ and install the desktop dependencies so video and Qt tests are available. From the repository root on macOS/Linux:
+Use Python 3.13 and install the desktop dependencies so video and Qt tests are available. From the repository root on macOS/Linux:
 
 ```sh
-python3 -m venv .venv
+python3.13 -m venv .venv
 . .venv/bin/activate
 python -m pip install -r requirements-hu.txt
 python -m hu_lab.desktop --demo
 ```
 
-On Windows, use `py -3 -m venv .venv`, activate `.\.venv\Scripts\Activate.ps1`, then run the same `python -m pip` and `python -m hu_lab.desktop` commands. Real USB access additionally needs native libusb; the demo does not open USB. The packaged releases already include libusb.
+On Windows, use `py -3.13 -m venv .venv`, activate `.\.venv\Scripts\Activate.ps1`, then run the same `python -m pip` and `python -m hu_lab.desktop` commands. Real USB access additionally needs native libusb; the demo does not open USB. The packaged releases already include libusb.
+
+On Linux, use Python 3.13 with the pinned dependencies. The PySide6 6.12.0 Linux wheel has a signal-reference bug under Python 3.11; its minimal reproduction does not use application code. The packaged macOS runtime was verified separately. See the [CPython limited-ABI fix](https://github.com/python/cpython/commit/9258f3da9175134d03f2c8c7c7eed223802ad945) for the build-header issue.
 
 ## Build
 

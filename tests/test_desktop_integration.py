@@ -4,14 +4,19 @@ These tests do not create Qt windows, open audio devices, or access USB/ADB.
 The peer listens on a fresh ephemeral loopback port for each session.
 """
 from contextlib import contextmanager
+from fractions import Fraction
 import tempfile
+import threading
 import time
 import unittest
+from unittest.mock import patch
 
+from hu_lab.client import annexb_nals
 from hu_lab.desktop_audio import PCMPlaybackBuffer
 from hu_lab.desktop_demo import DemoPeer
 from hu_lab.desktop_session import DesktopConfig, create_client
-from hu_lab.protocol import HARD_KEY, TOUCH_ACTION, VIDEO_RESET, fields
+from hu_lab.protocol import (HARD_KEY, TOUCH_ACTION, VIDEO_RESET, VIDEO_START,
+    CMD, VIDEO, VIDEO_DATA, MD_INFO, MEDIACODEC_AU_MARKER, Packet, ProtocolError, fields, protobuf)
 from hu_lab.touch import ACTION3, two_pointer_gesture
 
 
@@ -48,6 +53,57 @@ def demo_session(profile="v1", width=320, height=240, touch_profile="legacy-sing
 
 
 class DesktopIntegrationTest(unittest.TestCase):
+    def held_frame_resume(self, profile, *, idr):
+        with demo_session(profile) as (client, peer, sink, frames):
+            entered, release = threading.Event(), threading.Event()
+            held = []
+            original = peer._send
+            def send(*packets):
+                for packet in packets:
+                    if packet.channel != VIDEO or packet.message != VIDEO_DATA or entered.is_set():
+                        continue
+                    kinds = [kind for kind, _ in annexb_nals(packet.payload)]
+                    if (5 in kinds) == idr:
+                        held.append((packet, kinds))
+                        entered.set()
+                        if not release.wait(3):
+                            raise RuntimeError('held demo AU was not released')
+                return original(*packets)
+            with patch.object(peer, '_send', side_effect=send):
+                try:
+                    self.assertTrue(entered.wait(3), peer.error)
+                    before, generation = client.decoded_frames, client.decoder_generation
+                    client.pause()
+                    client.resume()
+                finally:
+                    release.set()
+                await_state(lambda: client.decoded_frames >= before + 3 and
+                            sum(message == VIDEO_START for message, _ in peer.commands) >= 2,
+                            client, peer)
+                self.assertIsNone(client.error)
+                self.assertIsNone(peer.error)
+                self.assertEqual(len(held), 1)
+                if idr:
+                    self.assertTrue(all(kind in held[0][1] for kind in (7, 8, 5)))
+                    self.assertGreater(held[0][0].timestamp, 0)
+                    self.assertEqual(client.resume_pts_restarts, 1)
+                    self.assertEqual(client.decoder_generation, generation + 2)
+                else:
+                    self.assertNotIn(5, held[0][1])
+                    self.assertGreaterEqual(client.resume_discarded_aus, 1)
+                    self.assertGreaterEqual(client.resume_discarded_bytes, len(held[0][0].payload))
+                    self.assertEqual(client.decoder_generation, generation + 1)
+
+    def test_resume_discards_a_real_old_p_frame_already_in_flight(self):
+        for profile in ('v1', 'honda-v2'):
+            with self.subTest(profile=profile):
+                self.held_frame_resume(profile, idr=False)
+
+    def test_resume_accepts_one_new_encoder_after_an_old_idr_in_flight(self):
+        for profile in ('v1', 'honda-v2'):
+            with self.subTest(profile=profile):
+                self.held_frame_resume(profile, idr=True)
+
     def test_both_profiles_decode_audio_input_pause_and_resume(self):
         for profile in ("v1", "honda-v2"):
             with self.subTest(profile=profile), demo_session(profile) as (client, peer, sink, frames):
@@ -108,6 +164,86 @@ class DesktopIntegrationTest(unittest.TestCase):
             self.assertEqual(frames[-1][1:3], (640, 360))
             self.assertEqual(second.session.requested["width"], 640)
             self.assertIsNone(second.error)
+
+
+class ResumeReferenceBoundsTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import av
+        codec = av.CodecContext.create('libx264', 'w')
+        codec.width, codec.height, codec.pix_fmt = 320, 240, 'yuv420p'
+        codec.time_base, codec.framerate = Fraction(1, 15), Fraction(15, 1)
+        codec.options = {'preset': 'ultrafast', 'tune': 'zerolatency',
+                         'x264-params': 'keyint=15:scenecut=0:repeat-headers=1'}
+        packets = []
+        for pts in (0, 1):
+            frame = av.VideoFrame(320, 240, 'yuv420p')
+            for index, plane in enumerate(frame.planes):
+                plane.update(bytes([16 if index == 0 else 128]) * plane.buffer_size)
+            frame.pts = pts
+            packets.extend(bytes(packet) for packet in codec.encode(frame))
+        cls.idr, cls.dependent = packets
+
+    def setUp(self):
+        self.output = tempfile.TemporaryDirectory()
+        self.addCleanup(self.output.cleanup)
+        self.client = create_client(DesktopConfig(width=320, height=240, fps=15), self.output.name)
+        self.client.session.state = 'STREAMING'
+        self.client._receive_packet(Packet(CMD, MD_INFO, protobuf(f15=MEDIACODEC_AU_MARKER)), None)
+        def close():
+            self.client.halt.set()
+            self.client.stop()
+        self.addCleanup(close)
+
+    def receive(self, data, timestamp):
+        self.client._receive_packet(Packet(VIDEO, VIDEO_DATA, data, timestamp), None)
+
+    def resume(self):
+        self.receive(self.idr, 100)
+        self.client.pause()
+        self.client.resume()
+
+    def test_initial_dependent_au_stays_fatal_even_after_pause_without_a_first_frame(self):
+        self.client.pause()
+        self.client.resume()
+        with self.assertRaisesRegex(ProtocolError, 'first complete AU'):
+            self.receive(self.dependent, 0)
+
+    def test_resume_does_not_allow_backwards_pts_on_a_dependent_frame(self):
+        self.resume()
+        self.receive(self.idr, 200)
+        with self.assertRaisesRegex(ProtocolError, 'PTS moved backwards'):
+            self.receive(self.dependent, 199)
+
+    def test_resume_allows_only_one_header_proven_pts_restart(self):
+        self.resume()
+        self.receive(self.idr, 200)
+        self.receive(self.idr, 100)
+        self.assertEqual(self.client.resume_pts_restarts, 1)
+        with self.assertRaisesRegex(ProtocolError, 'PTS moved backwards'):
+            self.receive(self.idr, 0)
+
+    def test_resume_wait_is_bounded_by_time_even_without_more_video(self):
+        self.resume()
+        with patch('hu_lab.client.time.monotonic', return_value=time.monotonic() + 9):
+            with self.assertRaisesRegex(ProtocolError, 'resume SPS/PPS/IDR wait exceeded deadline'):
+                self.client._resume_recovery_window()
+
+    def test_resume_wait_is_bounded_by_bytes(self):
+        self.resume()
+        # A complete opaque dependent AU remains bounded even if its slice is
+        # large. It is discarded before decoding and is never spliced or fixed.
+        large_dependent = self.dependent + bytes(1024 * 1024)
+        with self.assertRaisesRegex(ProtocolError, 'resume SPS/PPS/IDR wait exceeded byte_limit'):
+            for _ in range(5):
+                self.receive(large_dependent, 200)
+
+    def test_pts_restart_is_rejected_after_the_resume_window_expires(self):
+        self.resume()
+        self.receive(self.idr, 200)
+        with patch('hu_lab.client.time.monotonic', return_value=time.monotonic() + 9):
+            with self.assertRaisesRegex(ProtocolError, 'PTS moved backwards'):
+                self.receive(self.idr, 0)
 
 
 if __name__ == "__main__":

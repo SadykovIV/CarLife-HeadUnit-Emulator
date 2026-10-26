@@ -1,101 +1,53 @@
-"""Small native-binding probes; never bypass normal process finalization."""
+"""Reproduce PySide SignalInstance boolean ownership errors without app code.
+
+PySide6 6.12.0's Linux wheel loses one True reference per emit/disconnect
+under CPython 3.11. This resembles extensions built with the affected limited
+ABI Py_RETURN_TRUE macro; the wheel's build headers are not known here.
+The corresponding upstream CPython fix is:
+https://github.com/python/cpython/commit/9258f3da9175134d03f2c8c7c7eed223802ad945
+
+The macOS wheel on 3.11 passes; Linux CI uses Python 3.13.16. Run this script
+with the target runtime and wheel to verify its native signal operations.
+Every process still exits normally or reports its real error/abort status.
+"""
 import gc
 import json
 import sys
 
-
-def refs():
-    return [sys.getrefcount(True), sys.getrefcount(False)]
+from PySide6.QtCore import QObject, Signal, Slot
 
 
-def run(label, callback):
-    # Warm up imports and lazy converters before measuring a repeated operation.
-    callback()
+class Receiver(QObject):
+    ready = Signal()
+
+    @Slot()
+    def receive(self):
+        pass
+
+
+def measure(label, callback):
+    callback()  # Warm up the native signal path before counting references.
     gc.collect()
-    before = refs()
+    before = sys.getrefcount(True)
     for _ in range(200):
         callback()
     gc.collect()
-    after = refs()
-    print("NATIVE_PROBE", json.dumps({"label": label, "before": before, "after": after,
-                                     "delta": [end - start for start, end in zip(before, after)]}), flush=True)
+    after = sys.getrefcount(True)
+    print("SIGNAL_REFS", json.dumps({"operation": label, "before": before,
+                                    "after": after, "delta": after - before}), flush=True)
+    return after >= before
 
 
-def qt():
-    from PySide6.QtCore import QEvent, QObject, Qt, Signal, Slot
-    from PySide6.QtGui import QImage, QInputMethodQueryEvent, QPainter
-    from PySide6.QtWidgets import QApplication, QCheckBox, QWidget
-    import shiboken6
-
-    class Surface(QWidget):
-        def event(self, event):
-            if event.type() == QEvent.User:
-                return True
-            return super().event(event)
-
-        def inputMethodQuery(self, query):
-            if query == Qt.ImEnabled:
-                return True
-            return super().inputMethodQuery(query)
-
-    class Receiver(QObject):
-        ready = Signal()
-
-        @Slot()
-        def receive(self):
-            pass
-
-    app = QApplication([])
-    surface = Surface()
-    surface.show()
-    app.processEvents()
-    run("qt_virtual_event_true", lambda: QApplication.sendEvent(surface, QEvent(QEvent.User)))
-    run("qt_virtual_event_super", lambda: QApplication.sendEvent(surface, QEvent(QEvent.None_)))
-    run("qt_virtual_query_variant_bool", lambda: QApplication.sendEvent(surface, QInputMethodQueryEvent(Qt.ImEnabled)))
-    run("qt_widget_bool_property", lambda: surface.isEnabled())
-    checkbox = QCheckBox()
-    checkbox.toggled.connect(lambda checked: None)
-    run("qt_signal_bool", lambda: (checkbox.setChecked(True), checkbox.setChecked(False)))
+def main():
     receiver = Receiver()
     receiver.ready.connect(receiver.receive)
-    run("qt_signal_instance_emit", lambda: receiver.ready.emit())
-    run("qt_signal_instance_connect_disconnect", lambda: (receiver.ready.disconnect(receiver.receive), receiver.ready.connect(receiver.receive)))
-    image = QImage(32, 32, QImage.Format_RGB32)
-    image.fill(0)
-    painter = QPainter()
-    run("qt_painter_begin_end", lambda: (painter.begin(image), painter.end()))
-    run("qt_image_copy", lambda: image.copy())
-    pixels = bytes(32 * 32 * 3)
-    run("qt_image_buffer_copy", lambda: QImage(pixels, 32, 32, 32 * 3, QImage.Format_RGB888).copy())
-    surface.close()
-    shiboken6.delete(surface)
-    shiboken6.delete(checkbox)
-    return 0
-
-
-def video():
-    from fractions import Fraction
-    import av
-
-    frame = av.VideoFrame(32, 32, "yuv420p")
-    for plane in frame.planes:
-        plane.update(bytes(plane.buffer_size))
-    encoder = av.CodecContext.create("libx264", "w")
-    encoder.width = encoder.height = 32
-    encoder.pix_fmt = "yuv420p"
-    encoder.time_base = Fraction(1, 30)
-    encoder.options = {"preset": "ultrafast", "tune": "zerolatency"}
-    encoded = bytes(encoder.encode(frame)[0])
-    decoder = av.CodecContext.create("h264", "r")
-    run("av_frame_bool_properties", lambda: (frame.key_frame, frame.is_corrupt))
-    keyframe = decoder.decode(av.Packet(encoded))[0]
-    assert keyframe.key_frame
-    run("av_keyframe_true_property", lambda: keyframe.key_frame)
-    run("av_codec_bool_property", lambda: encoder.is_open)
-    run("av_decode", lambda: decoder.decode(av.Packet(encoded)))
-    run("av_to_image", lambda: frame.to_image())
+    emit_ok = measure("emit", receiver.ready.emit)
+    reconnect_ok = measure("disconnect/connect", lambda: (
+        receiver.ready.disconnect(receiver.receive), receiver.ready.connect(receiver.receive)))
+    if not emit_ok or not reconnect_ok:
+        raise AssertionError("Native SignalInstance calls lost references to the True singleton")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(qt() if sys.argv[1] == "qt" else video())
+    raise SystemExit(main())
