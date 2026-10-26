@@ -32,7 +32,7 @@ class RefcountResult(unittest.TextTestResult):
 def child(module, shutdown_qt=False):
     print("PROCESS_START", json.dumps({"module": module, "refs": bool_refs()}), flush=True)
     loader = unittest.TestLoader()
-    suite = loader.discover(str(ROOT / "tests")) if module == "ALL" else loader.loadTestsFromName(module)
+    suite = loader.discover(str(ROOT / "tests")) if module == "ALL" else loader.loadTestsFromNames(module.split(","))
     print("COLLECTED", json.dumps({"tests": suite.countTestCases(), "refs": bool_refs()}), flush=True)
     result = unittest.TextTestRunner(verbosity=1, resultclass=RefcountResult).run(suite)
     print("SUITE_FINISHED", json.dumps({"module": module, "tests": result.testsRun,
@@ -57,19 +57,30 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--module")
     parser.add_argument("--shutdown-qt", action="store_true")
+    parser.add_argument("--groups", action="store_true")
     args = parser.parse_args()
     if args.module:
         return child(args.module, args.shutdown_qt)
     results = {}
-    modules = ["ALL"] + ["tests." + path.stem for path in sorted((ROOT / "tests").glob("test_*.py"))]
-    for module in modules:
-        print("::group::Native process diagnostic: " + module, flush=True)
+    modules = ["tests." + path.stem for path in sorted((ROOT / "tests").glob("test_*.py"))]
+    groups = {module: module for module in ["ALL"] + modules}
+    if args.groups:
+        qt = {"tests.test_desktop_audio", "tests.test_desktop_input_ui",
+              "tests.test_desktop_keyboard_ui", "tests.test_desktop_ui",
+              "tests.test_gui_frame_wake", "tests.test_keyboard_input"}
+        split = len(modules) // 2
+        groups = {"first_half": ",".join(modules[:split]),
+                  "second_half": ",".join(modules[split:]),
+                  "qt_application_modules": ",".join(module for module in modules if module in qt),
+                  "other_modules": ",".join(module for module in modules if module not in qt)}
+    for label, module in groups.items():
+        print("::group::Native process diagnostic: " + label, flush=True)
         command = [sys.executable, "-X", "faulthandler", __file__, "--module", module]
         if args.shutdown_qt:
             command.append("--shutdown-qt")
         completed = subprocess.run(command, cwd=ROOT)
-        results[module] = completed.returncode
-        print("PROCESS_EXIT", json.dumps({"module": module, "returncode": completed.returncode}), flush=True)
+        results[label] = completed.returncode
+        print("PROCESS_EXIT", json.dumps({"module": label, "returncode": completed.returncode}), flush=True)
         print("::endgroup::", flush=True)
     print("DIAGNOSTIC_RESULTS", json.dumps(results), flush=True)
     return 1 if any(results.values()) else 0
