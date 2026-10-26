@@ -22,7 +22,7 @@ def run(label, callback):
 
 
 def qt():
-    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtCore import QEvent, QObject, Qt, Signal, Slot
     from PySide6.QtGui import QImage, QInputMethodQueryEvent, QPainter
     from PySide6.QtWidgets import QApplication, QCheckBox, QWidget
     import shiboken6
@@ -38,6 +38,13 @@ def qt():
                 return True
             return super().inputMethodQuery(query)
 
+    class Receiver(QObject):
+        ready = Signal()
+
+        @Slot()
+        def receive(self):
+            pass
+
     app = QApplication([])
     surface = Surface()
     surface.show()
@@ -49,11 +56,17 @@ def qt():
     checkbox = QCheckBox()
     checkbox.toggled.connect(lambda checked: None)
     run("qt_signal_bool", lambda: (checkbox.setChecked(True), checkbox.setChecked(False)))
+    receiver = Receiver()
+    receiver.ready.connect(receiver.receive)
+    run("qt_signal_instance_emit", lambda: receiver.ready.emit())
+    run("qt_signal_instance_connect_disconnect", lambda: (receiver.ready.disconnect(receiver.receive), receiver.ready.connect(receiver.receive)))
     image = QImage(32, 32, QImage.Format_RGB32)
     image.fill(0)
     painter = QPainter()
     run("qt_painter_begin_end", lambda: (painter.begin(image), painter.end()))
     run("qt_image_copy", lambda: image.copy())
+    pixels = bytes(32 * 32 * 3)
+    run("qt_image_buffer_copy", lambda: QImage(pixels, 32, 32, 32 * 3, QImage.Format_RGB888).copy())
     surface.close()
     shiboken6.delete(surface)
     shiboken6.delete(checkbox)
@@ -75,6 +88,9 @@ def video():
     encoded = bytes(encoder.encode(frame)[0])
     decoder = av.CodecContext.create("h264", "r")
     run("av_frame_bool_properties", lambda: (frame.key_frame, frame.is_corrupt))
+    keyframe = decoder.decode(av.Packet(encoded))[0]
+    assert keyframe.key_frame
+    run("av_keyframe_true_property", lambda: keyframe.key_frame)
     run("av_codec_bool_property", lambda: encoder.is_open)
     run("av_decode", lambda: decoder.decode(av.Packet(encoded)))
     run("av_to_image", lambda: frame.to_image())
