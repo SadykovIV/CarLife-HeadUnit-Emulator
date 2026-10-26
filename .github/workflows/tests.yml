@@ -62,7 +62,9 @@ jobs:
 
       - name: Run unit and loopback integration tests
         # USB is mocked; DemoPeer uses localhost and generated video/audio.
-        run: python -m unittest discover -s tests -v
+        # Canonical package imports avoid loading shared fixtures twice under
+        # both test_desktop_ui and tests.test_desktop_ui module identities.
+        run: python -m unittest discover -s tests -t . -v
 
       - name: Diagnose a failed test process
         if: failure()
