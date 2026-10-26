@@ -16,7 +16,7 @@ First GitHub release of the standalone **CarLife HeadUnit Emulator**, extracted 
 - Retain the QtNetwork Python binding required by QtMultimedia in the Windows package, including dependencies loaded dynamically through Shiboken.
 - Mark intentional demo shutdown before closing the client connection so Windows loopback aborts during teardown do not report a successful demo as failed.
 
-The current macOS arm64 package requires macOS 26+. The Windows x64 portable package is cross-built and has not been run on Windows. A source run with one HeadSwap device confirmed USB negotiation, video and HID registration/cleanup. Physical HID text delivery remains unverified. See the [validation history and limits](docs/MAC_HEADUNIT_APP.md#проверка-готовой-сборки).
+The current macOS arm64 package requires macOS 26+. Both packaged applications passed native GUI demos with clean shutdown; Windows libraries and its executable were checked on a Windows 2025 GitHub runner. Physical Windows USB and audio output remain unverified. A source run with one HeadSwap device confirmed USB negotiation, video and HID registration/cleanup. Physical HID text delivery remains unverified. See the [validation history and limits](docs/MAC_HEADUNIT_APP.md#проверка-готовой-сборки).
 
 ## 0.3.0 — 2026-10-25
 

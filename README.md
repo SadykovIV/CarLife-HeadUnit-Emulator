@@ -13,9 +13,11 @@ Get the appropriate ZIP from [GitHub Releases](https://github.com/SadykovIV/CarL
 | Package | Requirements and launch | Validation boundary |
 | --- | --- | --- |
 | `CarLife-HeadUnit-Emulator-0.3.1-macOS-arm64.zip` | Apple Silicon, **macOS 26+**. Extract and open `CarLife HeadUnit Emulator.app`. | macOS application and synthetic demo tested. USB negotiation, video and HID registration were also checked from source with one HeadSwap device; text delivery is still unverified. |
-| `CarLife-HeadUnit-Emulator-0.3.1-Windows-x64.zip` | Windows x64. Extract the **whole folder**, then run `CarLifeHeadUnitEmulator.exe`. | Cross-built package with dependency/hash/PE checks. **Not run on Windows**; Windows GUI, audio, USB drivers and physical HID delivery remain unverified. |
+| `CarLife-HeadUnit-Emulator-0.3.1-Windows-x64.zip` | Windows x64. Extract the **whole folder**, then run `CarLifeHeadUnitEmulator.exe`. | Packaged libraries and native GUI demo passed on a Windows 2025 GitHub runner, with clean shutdown. Physical Windows USB, audio output and HID text delivery remain unverified. |
 
 The macOS package has an ad hoc signature and is not notarized; the Windows executable is not Authenticode signed. The current macOS minimum comes from its bundled native libraries. Do not move the Windows executable away from the accompanying runtime files.
+
+Embedded `build-info.json` records checks at packaging time. Subsequent runtime results and archive hashes are recorded in `RELEASE.json`, attached to the release.
 
 Select **«Демо»** (Demo) in the top connection bar to try the application without a device. The demo generates local H.264 video and PCM audio; it does not establish hardware compatibility. You can also launch it with `--demo`:
 
