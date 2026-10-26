@@ -71,3 +71,9 @@ jobs:
         # Narrow a combined-process native failure to groups of test modules.
         # The ordinary test failure and every child exit remain visible.
         run: python .github/diagnose_tests.py --groups
+
+      - name: Probe native binding reference counts
+        if: failure()
+        run: |
+          python -X faulthandler .github/diagnose_native.py qt
+          python -X faulthandler .github/diagnose_native.py video
