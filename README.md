@@ -67,7 +67,7 @@ python -m hu_lab.desktop --demo
 
 On Windows, use `py -3.13 -m venv .venv`, activate `.\.venv\Scripts\Activate.ps1`, then run the same `python -m pip` and `python -m hu_lab.desktop` commands. Real USB access additionally needs native libusb; the demo does not open USB. The packaged releases already include libusb.
 
-On Linux, use Python 3.13 with the pinned dependencies. The PySide6 6.12.0 Linux wheel has a signal-reference bug under Python 3.11; its minimal reproduction does not use application code. The packaged macOS runtime was verified separately. See the [CPython limited-ABI fix](https://github.com/python/cpython/commit/9258f3da9175134d03f2c8c7c7eed223802ad945) for the build-header issue.
+On Linux, use Python 3.13 with the pinned dependencies. The PySide6 6.12.0 Linux wheel has a signal-reference bug under Python 3.11; its minimal reproduction does not use application code. The packaged macOS runtime was verified separately. A related build-header problem is documented in the [CPython limited-ABI fix](https://github.com/python/cpython/commit/9258f3da9175134d03f2c8c7c7eed223802ad945); the wheel's build headers have not been confirmed.
 
 ## Build
 

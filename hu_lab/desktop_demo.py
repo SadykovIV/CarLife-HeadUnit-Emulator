@@ -4,6 +4,7 @@ No device or external network access. This is a diagnostic pattern, not CarLife
 interoperability evidence. The server owns one loopback listener and one peer.
 """
 from fractions import Fraction
+import errno
 import math
 import socket
 import struct
@@ -22,6 +23,7 @@ class DemoPeer:
         self.listener.settimeout(.2)
         self.port = self.listener.getsockname()[1]
         self.halt = threading.Event()
+        self.closing = threading.Event()
         self.sock = None
         self.error = None
         self.commands = []
@@ -30,7 +32,18 @@ class DemoPeer:
         self.thread = threading.Thread(target=self._run, daemon=True, name='headunit-demo')
         self.thread.start()
 
+    def begin_close(self):
+        """Mark intentional client shutdown without closing the peer socket.
+
+        The client sends its final controls before closing TCP. On Windows,
+        that close can abort a simultaneous peer read/write with WSAECONNABORTED.
+        Keep serving until the client closes, but distinguish that expected
+        abort from a connection failure while the demo is running.
+        """
+        self.closing.set()
+
     def close(self):
+        self.begin_close()
         self.halt.set()
         self.listener.close()
         if self.sock:
@@ -54,7 +67,12 @@ class DemoPeer:
             self.sock.settimeout(.004)
             self._session()
         except (OSError, EOFError) as error:
-            if not self.halt.is_set() and not isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            expected_abort = self.closing.is_set() and self.sock is not None and (
+                isinstance(error, ConnectionAbortedError) or
+                getattr(error, 'errno', None) == errno.ECONNABORTED or
+                getattr(error, 'winerror', None) == 10053)
+            if (not self.halt.is_set() and not expected_abort and
+                    not isinstance(error, (BrokenPipeError, ConnectionResetError))):
                 self.error = str(error)
         except Exception as error:
             self.error = f'{type(error).__name__}: {error}'

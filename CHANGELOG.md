@@ -13,6 +13,8 @@ First GitHub release of the standalone **CarLife HeadUnit Emulator**, extracted 
 - Fix USB HID registration: use Android-compatible ID 1, reuse the AOA version captured during connection, and avoid a second GET_PROTOCOL request that can clear accessory identity. Start optional HID only after CarLife reaches STREAMING.
 - Do not send release/unregister after a definite registration rejection; distinguish optional keyboard errors from cleanup failures. Preserve the original USB write failure when cancellation wakes the reader first.
 - Keep rapid pause/resume working when old video frames remain in flight, while retaining bounded keyframe recovery and strict initial stream validation.
+- Retain the QtNetwork Python binding required by QtMultimedia in the Windows package, including dependencies loaded dynamically through Shiboken.
+- Mark intentional demo shutdown before closing the client connection so Windows loopback aborts during teardown do not report a successful demo as failed.
 
 The current macOS arm64 package requires macOS 26+. The Windows x64 portable package is cross-built and has not been run on Windows. A source run with one HeadSwap device confirmed USB negotiation, video and HID registration/cleanup. Physical HID text delivery remains unverified. See the [validation history and limits](docs/MAC_HEADUNIT_APP.md#проверка-готовой-сборки).
 

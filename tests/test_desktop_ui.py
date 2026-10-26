@@ -10,6 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from pathlib import Path
 import json
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -271,6 +272,38 @@ class DesktopWindowTests(unittest.TestCase):
         self.assertIn("Synthetic activity failure", saved_report["macos_activity"]["error"])
         self.assertGreater(saved_report["decoded_frames"], 0)
         self.assertFalse(saved_report["desktop_cleanup_errors"])
+
+    def test_disconnect_marks_demo_closing_before_client_socket_shutdown(self):
+        client, peer = self.start_demo()
+        abort = threading.Event()
+        send, stop = peer._send, client.stop
+        error = OSError('Windows established connection aborted')
+        error.winerror = 10053
+
+        def send_until_close(*packets):
+            if abort.is_set():
+                raise error
+            return send(*packets)
+
+        def stop_client():
+            # Emulate Windows aborting the peer's next socket operation while
+            # the client closes, before disconnect calls DemoPeer.close().
+            abort.set()
+            peer.thread.join(2)
+            self.assertFalse(peer.thread.is_alive())
+            stop()
+
+        with patch.object(peer, '_send', side_effect=send_until_close), \
+                patch.object(client, 'stop', side_effect=stop_client):
+            self.window.disconnect_session()
+            self.wait_for(lambda: self.window.client is None and not self.window.busy)
+        report = self.window.last_report
+        self.assertGreater(report['decoded_frames'], 0)
+        self.assertEqual(report['state'], 'DISCONNECTED')
+        self.assertIsNone(report['error'])
+        self.assertIsNone(report['demo_error'])
+        self.assertFalse(report['desktop_cleanup_errors'])
+        self.assertFalse(report['workers_alive'])
 
     def test_controls_reset_resize_reconnect_and_async_close(self):
         window = self.window

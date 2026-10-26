@@ -949,6 +949,7 @@ class HeadUnitWindow(QMainWindow):
                 if keyboard: keyboard.close()
                 self.activity.close()
                 try:
+                    if peer: peer.begin_close()
                     if client: client.stop()
                 finally:
                     if peer: peer.close()
@@ -1013,6 +1014,7 @@ class HeadUnitWindow(QMainWindow):
                 except Exception as error:
                     cleanup_errors.append(f'Keyboard stop: {error}')
             try:
+                if peer: peer.begin_close()
                 client.stop()
             except Exception as error:
                 cleanup_errors.append(f'Stop: {error}')
