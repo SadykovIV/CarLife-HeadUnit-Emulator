@@ -29,7 +29,7 @@ class RefcountResult(unittest.TextTestResult):
         super().stopTest(test)
 
 
-def child(module):
+def child(module, shutdown_qt=False):
     print("PROCESS_START", json.dumps({"module": module, "refs": bool_refs()}), flush=True)
     loader = unittest.TestLoader()
     suite = loader.discover(str(ROOT / "tests")) if module == "ALL" else loader.loadTestsFromName(module)
@@ -39,20 +39,35 @@ def child(module):
                                        "successful": result.wasSuccessful(), "refs": bool_refs()}), flush=True)
     gc.collect()
     print("GC_FINISHED", json.dumps({"module": module, "refs": bool_refs()}), flush=True)
+    if shutdown_qt:
+        from PySide6.QtWidgets import QApplication
+        application = QApplication.instance()
+        if application is not None:
+            # Documented PySide testing support; normal interpreter shutdown
+            # still follows and its exit status remains part of the result.
+            # https://doc.qt.io/qtforpython-6/considerations.html#testing-support
+            application.shutdown()
+            if QApplication.instance() is not None:
+                raise AssertionError("QApplication survived explicit shutdown")
+        print("QT_SHUTDOWN_FINISHED", json.dumps({"module": module, "refs": bool_refs()}), flush=True)
     return 0 if result.wasSuccessful() else 1
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--module")
+    parser.add_argument("--shutdown-qt", action="store_true")
     args = parser.parse_args()
     if args.module:
-        return child(args.module)
+        return child(args.module, args.shutdown_qt)
     results = {}
     modules = ["ALL"] + ["tests." + path.stem for path in sorted((ROOT / "tests").glob("test_*.py"))]
     for module in modules:
         print("::group::Native process diagnostic: " + module, flush=True)
-        completed = subprocess.run([sys.executable, "-X", "faulthandler", __file__, "--module", module], cwd=ROOT)
+        command = [sys.executable, "-X", "faulthandler", __file__, "--module", module]
+        if args.shutdown_qt:
+            command.append("--shutdown-qt")
+        completed = subprocess.run(command, cwd=ROOT)
         results[module] = completed.returncode
         print("PROCESS_EXIT", json.dumps({"module": module, "returncode": completed.returncode}), flush=True)
         print("::endgroup::", flush=True)

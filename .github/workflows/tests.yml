@@ -66,6 +66,6 @@ jobs:
 
       - name: Diagnose a failed test process
         if: failure()
-        # Keep failures visible; isolated child exit codes identify whether a
-        # native shutdown failure is local to one module or shared Qt state.
-        run: python .github/diagnose_tests.py
+        # Compare the same combined suite with explicit Qt testing shutdown.
+        # The ordinary test failure and native process exit remain visible.
+        run: python .github/diagnose_tests.py --module ALL --shutdown-qt
