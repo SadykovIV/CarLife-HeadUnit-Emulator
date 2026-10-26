@@ -14,6 +14,8 @@ import time
 import unittest
 from unittest.mock import patch
 
+from tests import dispose_qt_object
+
 try:
     import av
     from PySide6.QtCore import Qt
@@ -82,6 +84,7 @@ class DesktopWindowTests(unittest.TestCase):
         try:
             self.window.close()
             self.wait_for(lambda: not self.window.isVisible() and not self.window.busy, 12)
+            dispose_qt_object(self.window)
         finally:
             self.tmp.cleanup()
 
@@ -190,6 +193,7 @@ class DesktopWindowTests(unittest.TestCase):
         window.fallback.setChecked(False)
         window.close()
         self.wait_for(lambda: not window.isVisible() and not window.busy)
+        dispose_qt_object(window)
         saved_path = Path(self.tmp.name) / "settings.json"
         saved = json.loads(saved_path.read_text())
         self.assertNotIn("aoa_start", saved)

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import os
 import threading
 import unittest
+from tests import dispose_qt_object
 from unittest.mock import patch
 
 # Share a widget-capable application with later UI tests in a combined suite.
@@ -180,6 +181,7 @@ class QtPlaybackContractTest(unittest.TestCase):
 
     def tearDown(self):
         self.player.close()
+        dispose_qt_object(self.player)
         self.devices.stop()
         self.sinks.stop()
 

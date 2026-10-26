@@ -14,6 +14,8 @@ import time
 import unittest
 from unittest.mock import patch
 
+from tests import dispose_qt_object
+
 try:
     import av
     from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
@@ -60,6 +62,7 @@ class DesktopInputWindowTests(unittest.TestCase):
     def tearDown(self):
         self.window.close()
         self.wait_for(lambda: not self.window.isVisible() and not self.window.busy, 12)
+        dispose_qt_object(self.window)
 
     def wait_for(self, predicate, timeout=8):
         deadline = time.monotonic() + timeout
@@ -268,6 +271,7 @@ class DesktopInputWindowTests(unittest.TestCase):
     def reopen(self, settings=None):
         self.window.close()
         self.wait_for(lambda: not self.window.isVisible() and not self.window.busy, 12)
+        dispose_qt_object(self.window)
         if settings is not None:
             (Path(self.tmp.name) / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
         self.window = desktop.HeadUnitWindow(Path(self.tmp.name))
