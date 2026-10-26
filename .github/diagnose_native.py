@@ -23,7 +23,7 @@ def run(label, callback):
 
 def qt():
     from PySide6.QtCore import QEvent, Qt
-    from PySide6.QtGui import QInputMethodQueryEvent
+    from PySide6.QtGui import QImage, QInputMethodQueryEvent, QPainter
     from PySide6.QtWidgets import QApplication, QCheckBox, QWidget
     import shiboken6
 
@@ -49,6 +49,11 @@ def qt():
     checkbox = QCheckBox()
     checkbox.toggled.connect(lambda checked: None)
     run("qt_signal_bool", lambda: (checkbox.setChecked(True), checkbox.setChecked(False)))
+    image = QImage(32, 32, QImage.Format_RGB32)
+    image.fill(0)
+    painter = QPainter()
+    run("qt_painter_begin_end", lambda: (painter.begin(image), painter.end()))
+    run("qt_image_copy", lambda: image.copy())
     surface.close()
     shiboken6.delete(surface)
     shiboken6.delete(checkbox)
