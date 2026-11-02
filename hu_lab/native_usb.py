@@ -15,7 +15,7 @@ import socket
 import threading
 import time
 
-from .usb import LibUSB, RecoveryBlocked, USBIdentity, select_exact
+from .usb import LibUSB, RecoveryBlocked, USBIdentity, acquisition_stage, open_for_acquisition, select_exact
 from .platform_support import lock_owner, open_owner_lock, unlock_owner, usb_lock_directory
 
 ACCESSORY_IDS = ((0x18d1, 0x2d00), (0x18d1, 0x2d01))
@@ -90,6 +90,7 @@ class USBStream:
         self.timeout = .5
         self.closed = False
         self.close_lock = threading.Lock()
+        self.close_callbacks = []
         self.send_lock = threading.Lock()
         self.first_write_complete = False
         self.write_failed = False
@@ -164,6 +165,20 @@ class USBStream:
     def shutdown(self, _how=socket.SHUT_RDWR):
         self.handle.cancel.set()
 
+    def add_close_callback(self, callback):
+        """Retire an optional USB user before releasing the shared handle.
+
+        A client worker can close the stream on protocol failure before the UI
+        notices. Registration and close share the same lock; a late subscriber
+        is closed immediately instead of starting on a retired USB session.
+        Callbacks must not close/register on this stream themselves.
+        """
+        with self.close_lock:
+            if self.closed:
+                callback()
+            else:
+                self.close_callbacks.append(callback)
+
     def close(self):
         with self.close_lock:
             if self.closed:
@@ -171,6 +186,13 @@ class USBStream:
             self.closed = True
             self.pending.clear()
             try:
+                callbacks, self.close_callbacks = self.close_callbacks, []
+                for callback in callbacks:
+                    try:
+                        callback()
+                    except Exception as error:
+                        self.evidence.setdefault("close_callback_errors", []).append(
+                            f"{type(error).__name__}: {error}")
                 self.handle.close()
             finally:
                 try:
@@ -236,10 +258,11 @@ class NativeUSBTransportFactory:
         self.event("aoa_start_intent_durable", path=str(path), transition_sha256=ref["sha256"])
 
     def __call__(self):
-        self.admission.require(self.identity)
-        # A shared physical-port lock survives address/VID/PID changes.
-        key = self.identity.physical_key.replace(":", "-")
-        owner = open_owner_lock(usb_lock_directory() / f"carlife-usb-{key}.lock")
+        with acquisition_stage("native_discovery", self.identity):
+            self.admission.require(self.identity)
+            # A shared physical-port lock survives address/VID/PID changes.
+            key = self.identity.physical_key.replace(":", "-")
+            owner = open_owner_lock(usb_lock_directory() / f"carlife-usb-{key}.lock")
         usb = handle = None
         try:
             try:
@@ -252,49 +275,78 @@ class NativeUSBTransportFactory:
                                     "owner": "CarLife HU", "scope": self.admission.scope}))
             owner.flush()
             self.invocations += 1
-            usb = self.usb_factory()
-            devices = usb.discover()
-            try:
-                selected = select_exact(devices, self.identity)
-            except ValueError:
-                selected = select_exact(devices, self.identity, reenumerated=True)
-            selected_identity = USBIdentity(**{**selected["identity"],
-                "ports": tuple(selected["identity"]["ports"]), "serial_sha256": self.identity.serial_sha256})
-            self.admission.require(selected_identity)
-            handle = usb.open_exact(selected_identity)  # Verifies actual serial before any 51/52/53 or claim.
+            with acquisition_stage("native_discovery", self.identity):
+                usb = self.usb_factory()
+                devices = usb.discover()
+                try:
+                    selected = select_exact(devices, self.identity)
+                except ValueError:
+                    selected = select_exact(devices, self.identity, reenumerated=True)
+                selected_identity = USBIdentity(**{**selected["identity"],
+                    "ports": tuple(selected["identity"]["ports"]), "serial_sha256": self.identity.serial_sha256})
+                self.admission.require(selected_identity)
+            stage = ("native_accessory_open" if (selected_identity.vid, selected_identity.pid) in ACCESSORY_IDS
+                     else "native_normal_open")
+            handle = open_for_acquisition(usb, selected_identity, selected_identity=self.identity, stage=stage)
             self.event("selected_serial_verified", identity=asdict(selected_identity), invocation=self.invocations)
             started_here = False
             protocol = None
             if (selected_identity.vid, selected_identity.pid) not in ACCESSORY_IDS:
-                if not self.allow_aoa_start or self.start_requested:
-                    raise RecoveryBlocked("No repeat AOA START; new normal-state transition needs a new reviewed transaction")
-                self._record_start_intent()
-                self.start_requested = True  # Unknown outcome must never replay START automatically.
-                self.event("aoa_start_requested", strings=self.strings, requests=[51, 52, 52, 52, 52, 52, 52, 53])
-                protocol = handle.start_accessory(self.strings, self.admission, observer=self.event)
+                with acquisition_stage("aoa_control", self.identity):
+                    if not self.allow_aoa_start or self.start_requested:
+                        raise RecoveryBlocked("No repeat AOA START; new normal-state transition needs a new reviewed transaction")
+                    self._record_start_intent()
+                    self.start_requested = True  # Unknown outcome must never replay START automatically.
+                    self.event("aoa_start_requested", strings=self.strings, requests=[51, 52, 52, 52, 52, 52, 52, 53])
+                # The result of a failed control transfer (especially START)
+                # can be unknown. Never label it complete or repeat the switch.
+                with acquisition_stage("aoa_control", self.identity, attempted_identity=selected_identity,
+                                       aoa_control_complete=None):
+                    protocol = handle.start_accessory(self.strings, self.admission, observer=self.event)
                 self.event("aoa_control_complete", aoa_version=protocol)
                 handle.close()
                 handle = None
-                selected = usb.wait_accessory(self.identity, self.cancel, self.reenumeration_timeout)
+                with acquisition_stage("post_aoa_wait", self.identity, aoa_control_complete=True):
+                    selected = usb.wait_accessory(self.identity, self.cancel, self.reenumeration_timeout)
                 selected_identity = USBIdentity(**{**selected["identity"],
                     "ports": tuple(selected["identity"]["ports"]), "serial_sha256": self.identity.serial_sha256})
-                handle = usb.open_exact(selected_identity)
+                handle = open_for_acquisition(usb, selected_identity, selected_identity=self.identity,
+                                              stage="post_aoa_accessory_open", aoa_control_complete=True)
                 self.event("accessory_reenumerated_serial_verified", identity=asdict(selected_identity))
                 started_here = True
-            handle.claim_accessory(self.admission)
+            with acquisition_stage("accessory_claim", self.identity, attempted_identity=selected_identity,
+                                   aoa_control_complete=started_here):
+                handle.claim_accessory(self.admission)
             evidence = {"backend": "DIRECT_USB_AOA", "identity": asdict(selected_identity),
                         "bulk_pair": asdict(handle.pair), "aoa_version": protocol,
                         "entry": "HOST_INITIATED_51_52_53" if started_here else "ALREADY_ACCESSORY",
                         "admission_scope": self.admission.scope, "recovery_kind": self.admission.recovery_kind,
                         "universal_recovery_verified": False, "adb_data_plane": False}
+            if getattr(handle, 'windows_selection', None) is not None:
+                evidence['windows_selection'] = handle.windows_selection
             self.event("accessory_claimed", **evidence)
             return USBStream(usb, handle, owner, evidence, observer=self.event)
         except Exception as error:
-            self.event("acquisition_failed", error=f"{type(error).__name__}: {error}",
-                       aoa_start_requested=self.start_requested, automatic_usb_rollback=False)
-            if handle is not None:
-                handle.close()
-            if usb is not None:
-                usb.close()
-            owner.close()
+            # Keep the actual acquisition exception, even if a secondary
+            # cleanup or a write to the diagnostic directory also fails.
+            secondary = []
+            for label, item in (("handle", handle), ("context", usb), ("owner", owner)):
+                if item is not None:
+                    try:
+                        item.close()
+                    except Exception as cleanup:
+                        secondary.append(f"{label}.close: {type(cleanup).__name__[:80]}")
+            details = getattr(error, "connection_failure", None)
+            if details is not None and secondary:
+                details["cleanup_errors"] = list(secondary)
+            try:
+                self.event("acquisition_failed", error=f"{type(error).__name__}: {error}",
+                           aoa_start_requested=self.start_requested, automatic_usb_rollback=False,
+                           connection_failure=details, cleanup_errors=list(secondary))
+            except Exception as log_error:
+                secondary.append(f"acquisition_failed log: {type(log_error).__name__[:80]}")
+                if details is not None:
+                    details["cleanup_errors"] = list(secondary)
+            if secondary and hasattr(error, "add_note"):
+                error.add_note("USB cleanup: " + "; ".join(secondary))
             raise

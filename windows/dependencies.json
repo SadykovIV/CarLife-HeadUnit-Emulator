@@ -1,4 +1,12 @@
 {
+  "build_headers": {
+    "name": "mingw-w64 headers",
+    "version": "13.0.0",
+    "commit": "de62c283f3383bd825c98518cb0a42ba071d4ac2",
+    "filename": "mingw-w64-v13.0.0-de62c28.tar.gz",
+    "url": "https://codeload.github.com/mingw-w64/mingw-w64/tar.gz/de62c283f3383bd825c98518cb0a42ba071d4ac2",
+    "sha256": "50670610efda2b0593f4e9dd5159ebf7d9088649684afed02220e98aca80e362"
+  },
   "python": {
     "version": "3.13.16",
     "filename": "python-3.13.16-embed-amd64.zip",
@@ -12,6 +20,6 @@
     {"name":"shiboken6","version":"6.12.0","filename":"shiboken6-6.12.0-cp310-abi3-win_amd64.whl","sha256":"a1906cb8116869178c64b6bab52623bbc8b4ceed7b30bfc3c9aa0f6e67f6438e","url":"https://files.pythonhosted.org/packages/2a/b6/bee97e7a2edeab72aafabb46ee5adc939790a638d107860b4cad7a20e407/shiboken6-6.12.0-cp310-abi3-win_amd64.whl"},
     {"name":"av","version":"18.1.0","filename":"av-18.1.0-cp311-abi3-win_amd64.whl","sha256":"ea1480b7a8d5405cb5f382b344731bf125fd2c1c6fae3964f6c48595628387ff","url":"https://files.pythonhosted.org/packages/33/b4/76ba21e46704f632004276b85289a1582e95f5eff760436d6149875a1881/av-18.1.0-cp311-abi3-win_amd64.whl"},
     {"name":"Pillow","version":"12.3.0","filename":"pillow-12.3.0-cp313-cp313-win_amd64.whl","sha256":"1cca606cd25738df4ed873d5ad46bbdb3d83b5cbca291f6b4ff13a4df6b0bbe8","url":"https://files.pythonhosted.org/packages/a6/9b/7a58e61d62be561da3a356fe2384d4059a6345fc130e23ef1c36a5b81d24/pillow-12.3.0-cp313-cp313-win_amd64.whl"},
-    {"name":"libusb-package","version":"1.0.30.0","filename":"libusb_package-1.0.30.0-py3-none-win_amd64.whl","sha256":"90808da724c8939a333d931d0c7226372ca5fefd98e2f2f3ef79fd918aa37522","url":"https://files.pythonhosted.org/packages/60/4a/ff49bd77f33af05ca26fee29d601beb1e19ca791bb86efece82a3833885c/libusb_package-1.0.30.0-py3-none-win_amd64.whl"}
+    {"name":"libusb-package","version":"1.0.30.0","dll_version":"1.0.30","dll_sha256":"62ccefaf3f99dc46f6739f803391958cf77c8bc9cb5cf44acda8512709a404db","filename":"libusb_package-1.0.30.0-py3-none-win_amd64.whl","sha256":"90808da724c8939a333d931d0c7226372ca5fefd98e2f2f3ef79fd918aa37522","url":"https://files.pythonhosted.org/packages/60/4a/ff49bd77f33af05ca26fee29d601beb1e19ca791bb86efece82a3833885c/libusb_package-1.0.30.0-py3-none-win_amd64.whl"}
   ]
 }

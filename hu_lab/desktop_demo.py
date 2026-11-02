@@ -13,6 +13,66 @@ import time
 from .protocol import (Packet, FrameParser, CMD, VIDEO, MEDIA, TOUCH, HU_VERSION,
     VERSION_MATCH, MD_INFO, VIDEO_INIT, VIDEO_INIT_DONE, VIDEO_START, VIDEO_PAUSE,
     VIDEO_RESET, VIDEO_DATA, TOUCH_ACTION, HARD_KEY, MEDIACODEC_AU_MARKER, fields, protobuf)
+from .cluster import (MEDIA_INFO, MEDIA_PROGRESS_BAR, MODULE_STATUS, NAVI_NEXT_TURN_INFO,
+                      SUBSCRIBE, SUBSCRIBE_DONE, SUBSCRIBE_START, SUBSCRIBE_STOP)
+from .honda_reference import list_body, repeated_entries
+
+
+class DemoCluster:
+    """Synthetic MD. Emit route/track packets only for modules the HU started."""
+    route = ((3, 'Набережная', 350), (7, 'Садовая улица', 120), (1, 'Проспект Мира', 1500))
+    tracks = (('Ночной рейс', 'Городские огни'), ('За поворотом', 'Северный ветер'))
+
+    def __init__(self):
+        self.subscribed = set()
+        self.started = None
+        self.last_tick = self.last_song = None
+
+    def command(self, packet):
+        if packet.message not in (SUBSCRIBE, SUBSCRIBE_START, SUBSCRIBE_STOP):
+            return None
+        ids = [entry[1] for entry in repeated_entries(packet.payload)]
+        available = {0, 2}.intersection(ids)
+        if packet.message == SUBSCRIBE:
+            support = list_body([dict(f1=n, f2=int(n in available)) for n in ids])
+            modules = list_body([dict(f1=2, f2=1), dict(f1=3, f2=1)])
+            return (Packet(CMD, SUBSCRIBE_DONE, support), Packet(CMD, MODULE_STATUS, modules))
+        if packet.message == SUBSCRIBE_START:
+            self.subscribed.update(available)
+            self.last_tick = self.last_song = None
+        else:
+            self.subscribed.difference_update(available)
+        return ()
+
+    def updates(self, now):
+        if not self.subscribed:
+            return ()
+        if self.started is None:
+            self.started = now
+        tick = int(now - self.started)
+        if tick == self.last_tick:
+            return ()
+        self.last_tick = tick
+        packets = []
+        if 0 in self.subscribed:
+            step = tick % 16
+            if step == 15:
+                turn = protobuf(f1=3, f2=24, f3='', f4=0, f5=0, f6=0)
+            else:
+                code, road, distance = self.route[step // 5]
+                turn = protobuf(f1=1 if step % 5 == 0 else 2, f2=code, f3=road,
+                                f4=distance, f5=distance * (4 - step % 5) // 4, f6=0)
+            packets.append(Packet(CMD, NAVI_NEXT_TURN_INFO, turn))
+        if 2 in self.subscribed:
+            song = (tick // 12) % len(self.tracks)
+            if song != self.last_song:
+                title, artist = self.tracks[song]
+                info = protobuf(f1='CarLife Demo', f2=title, f3=artist, f4='Демо-маршрут',
+                                f5=b'', f6=12, f7=2, f8=str(song), f9=0)
+                packets.append(Packet(CMD, MEDIA_INFO, info))
+                self.last_song = song
+            packets.append(Packet(CMD, MEDIA_PROGRESS_BAR, protobuf(f1=tick % 12 * 1000)))
+        return packets
 
 
 class DemoPeer:
@@ -94,6 +154,7 @@ class DemoPeer:
         last_action = 'Touch the display to test input'
         next_video = next_audio = time.monotonic()
         pcm_index = 0
+        cluster = DemoCluster()
         version = 1
         font = ImageFont.load_default(size=28)
         small_font = ImageFont.load_default(size=18)
@@ -120,16 +181,17 @@ class DemoPeer:
                 self.commands.append((p.message, p.payload))
                 if len(self.commands) > 512:
                     del self.commands[:256]
+                replies = cluster.command(p)
+                if replies is not None:
+                    if replies:
+                        self._send(*replies)
+                    continue
                 if p.message == HU_VERSION:
                     version = fields(p.payload).get(1, 1)
                     self._send(Packet(CMD, VERSION_MATCH, protobuf(f1=1)),
                                Packet(CMD, MD_INFO, protobuf(f4='Local synthetic MD', f15=MEDIACODEC_AU_MARKER)))
                     if version == 2:
                         self._send(Packet(CMD, 0x10051))
-                elif p.message == 0x18043:
-                    from .honda_reference import repeated_entries, list_body
-                    entries = repeated_entries(p.payload)
-                    self._send(Packet(CMD, 0x10044, list_body([dict(f1=e[1], f2=0) for e in entries])))
                 elif p.message == VIDEO_INIT:
                     mode = fields(p.payload)
                     width, height, fps = mode[1], mode[2], mode[3] or 30
@@ -156,6 +218,9 @@ class DemoPeer:
                         f = fields(p.payload)
                         last_action = f'CarLife key received: {f.get(1)}'
             now = time.monotonic()
+            updates = cluster.updates(now)
+            if updates:
+                self._send(*updates)
             if streaming and now >= next_video:
                 image = Image.new('RGB', (width, height), '#101b29')
                 draw = ImageDraw.Draw(image)

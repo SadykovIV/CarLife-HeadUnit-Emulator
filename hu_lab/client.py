@@ -1273,9 +1273,18 @@ class HUClient:
             self.error = "NATIVE_RX_DRAIN_NOT_QUIESCENT: no safe complete frame boundary before close"
 
     def stop(self):
-        if self.stopped:
-            return
-        self.stopped = True
+        with self.state_lock:
+            if self.stopped:
+                return
+            self.stopped = True
+            cluster = getattr(self.session, 'cluster', None)
+            if cluster is not None:
+                # _receive_packet enqueues START while holding the same lock;
+                # a late acknowledgement cannot enqueue START after this STOP.
+                for packet in cluster.close():
+                    if not self.halt.is_set():
+                        try: self.send(packet)
+                        except ProtocolError: pass
         if not self.halt.is_set():
             try:
                 if self.pending_touch:

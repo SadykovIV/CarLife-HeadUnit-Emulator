@@ -35,6 +35,13 @@ QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #577185; bor
 QCheckBox::indicator:checked { background: #67c5c0; border-color: #67c5c0; }
 QSplitter::handle { background: #293346; width: 1px; }
 QWidget#inspector { background: #192231; border-radius: 10px; }
+QFrame#clusterCard { background: #151d29; border: 1px solid #293346; border-radius: 12px; }
+QLabel#clusterHeading { color: #f1f7fb; font-size: 26px; font-weight: 700; }
+QLabel#clusterKicker { color: #8cddd7; font-size: 12px; font-weight: 700; }
+QLabel#clusterValue { color: #f1f7fb; font-size: 44px; font-weight: 700; }
+QLabel#clusterTitle { color: #e8edf5; font-size: 24px; font-weight: 600; }
+QLabel#clusterSecondary { color: #9aa7bb; font-size: 17px; }
+QLabel#clusterArrow { background: #173248; color: #edfafa; font-size: 58px; border-radius: 14px; }
 QLabel#badge { color: #8cddd7; border: 1px solid #67c5c0; border-radius: 10px; font-weight: 700; }
 QLabel#footer { color: #9aa7bb; padding: 9px 18px; border-top: 1px solid #293346; }
 '''

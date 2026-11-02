@@ -11,17 +11,43 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import urllib.request
 import zipfile
 
 PROJECT = Path(__file__).resolve().parents[1]
-VERSION = "0.3.1"
+VERSION = "0.3.2-rc.3"
 NAME = f"CarLife-HeadUnit-Emulator-{VERSION}-Windows-x64"
+RELEASE_CHANNEL = "diagnostic-test"
+_release, _, _rc = VERSION.partition("-rc.")
+PE_VERSION = ",".join((*_release.split("."), _rc or "0"))
+# ctypes resolves these at runtime, so they are not covered by PE import tables.
+REQUIRED_USB_EXPORTS = tuple("libusb_" + name for name in (
+    "get_version", "init", "exit", "get_device_list", "free_device_list", "get_session_data",
+    "get_device_descriptor", "get_bus_number", "get_device_address", "get_port_numbers",
+    "get_active_config_descriptor", "free_config_descriptor", "open", "close",
+    "claim_interface", "release_interface", "control_transfer", "get_string_descriptor_ascii",
+    "bulk_transfer"))
+WINDOWS_USB_MODULES = ("hu_lab.windows_accessory", "hu_lab.windows_usb_interfaces", "hu_lab.windows_winusb",
+                       "hu_lab.windows_driver_setup", "hu_lab.windows_setup_launcher")
+WINDOWS_USB_SYSTEM_EXPORTS = {
+    "winusb.dll": ("WinUsb_Initialize", "WinUsb_Free", "WinUsb_GetDescriptor",
+                   "WinUsb_GetCurrentAlternateSetting", "WinUsb_QueryInterfaceSettings",
+                   "WinUsb_QueryPipe", "WinUsb_ReadPipe", "WinUsb_WritePipe",
+                   "WinUsb_ControlTransfer", "WinUsb_GetOverlappedResult"),
+    "kernel32.dll": ("CreateFileW", "CreateEventW", "CloseHandle", "WaitForSingleObject", "CancelIoEx",
+                     "GetExitCodeProcess"),
+    "shell32.dll": ("ShellExecuteExW",),
+    "cfgmgr32.dll": ("CM_Get_Device_ID_Size", "CM_Get_Device_IDW", "CM_Locate_DevNodeW",
+                     "CM_Get_Parent", "CM_Get_Child", "CM_Get_Sibling", "CM_Get_DevNode_Registry_PropertyW",
+                     "CM_Enumerate_Classes", "CM_Get_Device_Interface_List_SizeW", "CM_Get_Device_Interface_ListW"),
+}
 SYSTEM_DLLS = set("""advapi32.dll authz.dll avicap32.dll avrt.dll bcrypt.dll cfgmgr32.dll
 combase.dll comctl32.dll comdlg32.dll crypt32.dll cryptbase.dll cryptsp.dll d2d1.dll
 d3d9.dll d3d11.dll d3d12.dll d3dcompiler_47.dll dcomp.dll dnsapi.dll dwmapi.dll
@@ -66,7 +92,7 @@ def extract(archive, destination):
 
 
 def snapshot():
-    paths = list((PROJECT / "hu_lab").glob("*.py"))
+    paths = list((PROJECT / "hu_lab").rglob("*.py"))
     paths += list((PROJECT / "hu_lab" / "assets").glob("*"))
     paths += list((PROJECT / "windows").glob("*"))
     paths += [PROJECT / "macos" / "entry.py", PROJECT / "macos" / "build.py"]
@@ -81,6 +107,51 @@ def llvm_tool(name):
         if (root / name).is_file():
             return str(root / name)
     raise RuntimeError(f"LLVM tool required: {name}")
+
+
+def verify_usb_library(library, record):
+    digest = sha256(library)
+    if digest != record["dll_sha256"]:
+        raise RuntimeError("Packaged libusb DLL differs from the pinned Windows binary")
+    listing = subprocess.run([llvm_tool("llvm-readobj"), "--coff-exports", str(library)],
+                             check=True, capture_output=True, text=True).stdout
+    exports = set(re.findall(r"^\s*Name: (\S+)\s*$", listing, re.MULTILINE))
+    missing = sorted(set(REQUIRED_USB_EXPORTS) - exports)
+    if missing:
+        raise RuntimeError("Missing libusb exports: " + ", ".join(missing))
+    return {"name": library.name, "sha256": digest, "version": record["dll_version"],
+            "required_exports": list(REQUIRED_USB_EXPORTS), "static_export_check": "PASS"}
+
+
+def prepare_native_headers(archive, record, work):
+    """Materialize only the pinned upstream Windows headers; nothing is installed on the host."""
+    if sha256(archive) != record["sha256"]:
+        raise RuntimeError("Windows headers archive hash mismatch")
+    source, output, prefix = work / "sdk-source", work / "sdk-build", work / "sdk"
+    for folder in (source, output, prefix):
+        folder.mkdir(parents=True, exist_ok=True)
+    member_prefix = f"mingw-w64-{record['commit']}/mingw-w64-headers/"
+    with tarfile.open(archive, "r:gz") as upstream:
+        for member in upstream:
+            if not member.name.startswith(member_prefix) or not member.isfile():
+                continue
+            rel = Path(member.name[len(member_prefix):])
+            if rel.is_absolute() or ".." in rel.parts:
+                raise RuntimeError("Unsafe Windows SDK archive member")
+            file = source / rel
+            file.parent.mkdir(parents=True, exist_ok=True)
+            with upstream.extractfile(member) as src, file.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+            file.chmod(0o755 if member.mode & 0o111 else 0o644)
+    subprocess.run([str(source / "configure"), "--host=x86_64-w64-mingw32", "--without-widl",
+                    "--enable-sdk=all", "--enable-crt", "--prefix=" + str(prefix)],
+                   cwd=output, stdout=subprocess.DEVNULL, check=True)
+    subprocess.run(["make", "install"], cwd=output, stdout=subprocess.DEVNULL, check=True)
+    include = prefix / "include"
+    for name in ("windows.h", "setupapi.h", "newdev.h", "cfgmgr32.h", "winusb.h"):
+        if not (include / name).is_file():
+            raise RuntimeError(f"Missing required Windows SDK header: {name}")
+    return include
 
 
 def compile_launcher(stage, work):
@@ -101,10 +172,11 @@ def compile_launcher(stage, work):
         libraries.append(str(library))
     resource = work / "launcher.rc"
     resource.write_text('1 ICON "HeadUnit.ico"\n'
-        '1 VERSIONINFO\nFILEVERSION 0,3,1,0\nPRODUCTVERSION 0,3,1,0\nFILEOS 0x40004\nFILETYPE 1\nBEGIN\n'
+        f'1 VERSIONINFO\nFILEVERSION {PE_VERSION}\nPRODUCTVERSION {PE_VERSION}\n'
+        'FILEFLAGSMASK 0x3F\nFILEFLAGS 0x02\nFILEOS 0x40004\nFILETYPE 1\nBEGIN\n'
         'BLOCK "StringFileInfo" BEGIN BLOCK "040904B0" BEGIN\n'
-        'VALUE "FileDescription", "CarLife HeadUnit Emulator"\nVALUE "ProductName", "CarLife HeadUnit Emulator"\n'
-        'VALUE "FileVersion", "0.3.1"\nVALUE "ProductVersion", "0.3.1"\n'
+        'VALUE "FileDescription", "CarLife HeadUnit Emulator (USB diagnostic test build)"\nVALUE "ProductName", "CarLife HeadUnit Emulator"\n'
+        f'VALUE "FileVersion", "{VERSION}"\nVALUE "ProductVersion", "{VERSION}"\n'
         'VALUE "OriginalFilename", "CarLifeHeadUnitEmulator.exe"\nEND END\n'
         'BLOCK "VarFileInfo" BEGIN VALUE "Translation", 0x409, 1200 END\nEND\n')
     subprocess.run([llvm_tool("llvm-rc"), "/fo", "launcher.res", "launcher.rc"], cwd=work, check=True)
@@ -115,6 +187,54 @@ def compile_launcher(stage, work):
                     "/nodefaultlib", "/dynamicbase", "/nxcompat", "/highentropyva", "/timestamp:0",
                     "/out:" + str(stage / "CarLifeHeadUnitEmulator.exe"), str(work / "launcher.obj"),
                     str(work / "launcher.res"), *libraries], check=True)
+
+
+def compile_driver_setup(stage, work, header_archive, header_record):
+    """Link a standalone x64 EXE: never elevate the interpreter or a script."""
+    name = "CarLifeWinUsbSetup.exe"
+    include = prepare_native_headers(header_archive, header_record, work / "native-sdk")
+    helper = work / "helper"
+    helper.mkdir()
+    # The only imported DLL at process startup is a Windows KnownDLL. All
+    # installer APIs are loaded by the native helper from System32 explicitly.
+    exports = ("SetDefaultDllDirectories", "GetSystemDirectoryW", "GetSystemWindowsDirectoryW", "LoadLibraryExW", "GetProcAddress",
+               "GetLastError", "GetCommandLineW", "ExitProcess", "CompareStringOrdinal", "LocalFree", "Sleep")
+    (helper / "kernel32.def").write_text("LIBRARY kernel32.dll\nEXPORTS\n" + "\n".join(exports) + "\n")
+    subprocess.run([llvm_tool("llvm-dlltool"), "-m", "i386:x86-64", "-d", "kernel32.def", "-l", "kernel32.lib"],
+                   check=True, cwd=helper)
+    (helper / "setup.rc").write_text(
+        '1 24 "setup.manifest"\n'
+        f'1 VERSIONINFO\nFILEVERSION {PE_VERSION}\nPRODUCTVERSION {PE_VERSION}\n'
+        'FILEFLAGSMASK 0x3F\nFILEFLAGS 0x02\nFILEOS 0x40004\nFILETYPE 1\nBEGIN\n'
+        'BLOCK "StringFileInfo" BEGIN BLOCK "040904B0" BEGIN\n'
+        'VALUE "FileDescription", "CarLife HeadUnit Emulator - AOA MI_00 WinUSB setup"\n'
+        'VALUE "ProductName", "CarLife HeadUnit Emulator"\n'
+        f'VALUE "FileVersion", "{VERSION}"\nVALUE "ProductVersion", "{VERSION}"\n'
+        f'VALUE "OriginalFilename", "{name}"\nEND END\n'
+        'BLOCK "VarFileInfo" BEGIN VALUE "Translation", 0x409, 1200 END\nEND\n', encoding="ascii")
+    (helper / "setup.manifest").write_text(
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">'
+        '<trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"><security><requestedPrivileges>'
+        '<requestedExecutionLevel level="asInvoker" uiAccess="false"/>'
+        '</requestedPrivileges></security></trustInfo></assembly>', encoding="ascii")
+    subprocess.run([llvm_tool("llvm-rc"), "/fo", "setup.res", "setup.rc"], cwd=helper, check=True)
+    subprocess.run([llvm_tool("clang"), "--target=x86_64-w64-windows-gnu", "-isystem", str(include),
+                    "-D_WIN32_WINNT=0x0A00", "-O2", "-ffreestanding",
+                    "-fno-builtin", "-fno-stack-protector", "-mno-stack-arg-probe",
+                    "-Werror=implicit-function-declaration", "-Werror=incompatible-pointer-types",
+                    "-c", str(PROJECT / "windows/winusb_setup.c"), "-o", "setup.obj"],
+                   cwd=helper, check=True)
+    exe = stage / name
+    subprocess.run([llvm_tool("lld-link"), "/machine:x64", "/subsystem:windows", "/entry:mainCRTStartup",
+                    "/nodefaultlib", "/dynamicbase", "/nxcompat", "/highentropyva", "/timestamp:0",
+                    "/stack:4194304,4194304", "/out:" + str(exe), "setup.obj", "setup.res", "kernel32.lib"],
+                   cwd=helper, check=True)
+    if {n.lower() for n in inspect_pe(exe)} != {"kernel32.dll"}:
+        raise RuntimeError("Unexpected native driver helper startup import")
+    return {"name": name, "sha256": sha256(exe), "bytes": exe.stat().st_size,
+            "architecture": "x64", "startup_imports": ["kernel32.dll"], "authenticode_signed": False,
+            "scope": "Exact AOA 18D1:2D01 MI_00 only, with user confirmation and Windows UAC"}
 
 
 def inspect_pe(path):
@@ -211,6 +331,7 @@ def trim_qt_and_verify(stage):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache-dir", type=Path, default=PROJECT / "build" / "windows-downloads")
+    parser.add_argument("--headers-cache-dir", type=Path, default=PROJECT / "build" / "windows-sdk-cache")
     parser.add_argument("--dist-dir", type=Path, default=PROJECT / "dist")
     parser.add_argument("--download-only", action="store_true")
     parser.add_argument("--replace", action="store_true", help="Replace this builder's versioned output")
@@ -220,6 +341,9 @@ def main():
     records = [dependencies["python"], *dependencies["wheels"]]
     with ThreadPoolExecutor(max_workers=4) as workers:
         list(workers.map(lambda record: download(record, args.cache_dir), records))
+    args.headers_cache_dir.mkdir(parents=True, exist_ok=True)
+    header_record = dependencies["build_headers"]
+    header_archive = download(header_record, args.headers_cache_dir)
     if args.download_only:
         print("Verified all Windows runtime downloads.")
         return 0
@@ -228,6 +352,10 @@ def main():
     if target.exists() and not args.replace:
         parser.error(f"Output exists: {target}; pass --replace to rebuild it")
     before = snapshot()
+    for module in WINDOWS_USB_MODULES:
+        filename = module.replace(".", "/") + ".py"
+        if filename not in before:
+            raise RuntimeError(f"Missing required Windows USB module: {filename}")
     work_root = PROJECT / "build" / "windows-headunit"
     work_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="package-", dir=work_root) as temporary:
@@ -242,11 +370,14 @@ def main():
         (runtime / "python313._pth").write_text("python313.zip\n.\nLib/site-packages\n..\nimport site\n")
         shutil.copytree(PROJECT / "hu_lab", stage / "hu_lab", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         shutil.copy2(PROJECT / "windows" / "entry.py", stage / "entry.py")
+        shutil.copy2(PROJECT / "windows" / "verify_usb_runtime.py", stage / "verify_usb_runtime.py")
         shutil.copy2(PROJECT / "macos" / "entry.py", stage / "bundle_entry.py")
         usb_dlls = list((packages / "libusb_package").rglob("libusb-1.0.dll"))
         if len(usb_dlls) != 1:
             raise RuntimeError(f"Expected one libusb DLL, found {usb_dlls}")
         shutil.copy2(usb_dlls[0], stage / "libusb-1.0.dll")
+        usb_record = next(record for record in dependencies["wheels"] if record["name"] == "libusb-package")
+        usb_library = verify_usb_library(stage / "libusb-1.0.dll", usb_record)
         licenses = stage / "licenses"
         licenses.mkdir()
         for name in ("LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"):
@@ -254,7 +385,10 @@ def main():
         shutil.copy2(PROJECT / "hu_lab" / "assets" / "ICON_SOURCE.json", licenses / "Baidu-CarLife-artwork.json")
         shutil.copy2(PROJECT / "windows" / "README.ru.txt", stage / "README.ru.txt")
         (stage / "Verify.cmd").write_text('@echo off\r\n"%~dp0CarLifeHeadUnitEmulator.exe" --bundle-check --check-output "%TEMP%\\carlife-bundle-check.json"\r\nif errorlevel 1 exit /b 1\r\ntype "%TEMP%\\carlife-bundle-check.json"\r\n', encoding="ascii")
+        (stage / "VerifyUsbRuntime.cmd").write_bytes(
+            b'@echo off\r\n"%~dp0runtime\\python.exe" -X utf8 "%~dp0verify_usb_runtime.py" --output "%TEMP%\\carlife-libusb-check.json"\r\nexit /b %errorlevel%\r\n')
         compile_launcher(stage, work)
+        driver_setup_helper = compile_driver_setup(stage, work, header_archive, header_record)
         # All extracted licenses and original distribution metadata stay present.
         native, system_imports = trim_qt_and_verify(stage)
         after = snapshot()
@@ -262,6 +396,10 @@ def main():
             raise RuntimeError("Source changed during packaging; rerun after edits finish")
         info = {"name": "CarLife HeadUnit Emulator", "version": VERSION, "architecture": "x64", "platform": "win32",
                 "python": dependencies["python"]["version"], "built_utc": datetime.now(timezone.utc).isoformat(),
+                "release_channel": RELEASE_CHANNEL, "usb_library": usb_library,
+                "driver_setup_helper": driver_setup_helper, "build_headers": header_record,
+                "windows_usb": {"modules": list(WINDOWS_USB_MODULES),
+                                "system_exports": WINDOWS_USB_SYSTEM_EXPORTS},
                 "dependencies": {r["name"]: r["version"] for r in dependencies["wheels"]},
                 "source_sha256": before, "downloads": records,
                 "validation": {"native_x64_binaries": len(native), "source_unchanged": True,

@@ -100,6 +100,23 @@ class NativeUSBTests(unittest.TestCase):
         self.addCleanup(stream.close)
         return stream, clock, calls, budgets, events
 
+    def test_close_callback_failure_preserves_resource_cleanup_and_remaining_users(self):
+        order = []
+        handle = SimpleNamespace(close=lambda: order.append('handle'), cancel=threading.Event())
+        stream = USBStream(SimpleNamespace(close=lambda: order.append('usb')), handle,
+                           open(self.root / 'callback-lock', 'a+'), {})
+        def failed_user():
+            order.append('failed_user')
+            raise RuntimeError('fixture optional user cleanup failed')
+        stream.add_close_callback(failed_user)
+        stream.add_close_callback(lambda: order.append('second_user'))
+        stream.close()
+        stream.close()
+        self.assertEqual(order, ['failed_user', 'second_user', 'handle', 'usb'])
+        self.assertTrue(stream.owner_lock.closed)
+        self.assertEqual(stream.evidence['close_callback_errors'],
+                         ['RuntimeError: fixture optional user cleanup failed'])
+
     def test_first_write_waits_for_md_reader_then_preserves_timeout_partial_offset(self):
         delivered = bytearray()
         def transfer(part, timeout_ms, clock, cancel):

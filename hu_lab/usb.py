@@ -9,25 +9,35 @@ from __future__ import annotations
 
 import ctypes as C
 import ctypes.util
+from contextlib import contextmanager
 import hashlib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+import sys
 import threading
 import time
 from typing import Callable
 
 
 class USBError(RuntimeError):
-    def __init__(self, operation: str, code: int):
+    def __init__(self, operation: str, code: int, *, attempted_identity=None):
         self.operation, self.code = operation, code
+        self.attempted_identity = attempted_identity
         names = {-1: 'IO', -2: 'INVALID_PARAM', -3: 'ACCESS', -4: 'NO_DEVICE',
                  -5: 'NOT_FOUND', -6: 'BUSY', -7: 'TIMEOUT', -8: 'OVERFLOW',
                  -9: 'PIPE', -10: 'INTERRUPTED', -11: 'NO_MEM', -12: 'NOT_SUPPORTED'}
-        super().__init__(f'{operation}: libusb {names.get(code, code)}')
+        self.name = names.get(code, str(code))
+        super().__init__(f'{operation}: libusb {self.name}')
 
 
 class RecoveryBlocked(RuntimeError):
     pass
+
+
+class USBEnumerationChanged(RecoveryBlocked):
+    def __init__(self, message, observed_identity=None):
+        super().__init__(message)
+        self.observed_identity = observed_identity
 
 
 @dataclass(frozen=True)
@@ -42,6 +52,64 @@ class USBIdentity:
     @property
     def physical_key(self) -> str:
         return f'{self.bus}:' + '.'.join(map(str, self.ports))
+
+
+def _enumeration_record(identity):
+    if identity is None:
+        return None
+    # These fields identify an enumeration. Never export a serial or its hash.
+    return dict(bus=identity.bus, ports=list(identity.ports), vid=identity.vid,
+                pid=identity.pid, vid_pid=f'{identity.vid:04x}:{identity.pid:04x}', address=identity.address)
+
+
+@contextmanager
+def acquisition_stage(stage, selected_identity, *, attempted_identity=None, aoa_control_complete=False):
+    """Attach machine-readable acquisition evidence without replacing the failure."""
+    try:
+        yield
+    except Exception as error:
+        if getattr(error, 'connection_failure', None) is not None:
+            raise  # Preserve evidence from the most specific stage.
+        native = isinstance(error, USBError)
+        windows_reason = getattr(error, 'selection_reason', None)
+        if windows_reason is not None:
+            reason = 'windows_interface_selection'
+        elif getattr(error, 'native_api', None) == 'WinUSB':
+            reason = 'winusb_error'
+        elif native:
+            reason = 'usb_error'
+        elif isinstance(error, USBEnumerationChanged) or (stage in ('preflight_selection', 'native_discovery')
+                                                          and isinstance(error, ValueError)):
+            reason = 'enumeration_changed'
+        elif isinstance(error, TimeoutError):
+            reason = 'timeout'
+        elif isinstance(error, RecoveryBlocked):
+            reason = 'verification_failed'
+        else:
+            reason = 'acquisition_error'
+        attempted = getattr(error, 'attempted_identity', None) or attempted_identity
+        error.connection_failure = {
+            'stage': stage, 'reason': reason,
+            'selected_identity': _enumeration_record(selected_identity),
+            'attempted_identity': _enumeration_record(attempted),
+            'observed_identity': _enumeration_record(getattr(error, 'observed_identity', None)),
+            'operation': getattr(error, 'operation', None),
+            'code': error.code if native else None, 'name': error.name if native else None,
+            'aoa_control_complete': aoa_control_complete,
+        }
+        if windows_reason is not None:
+            error.connection_failure['selection_reason'] = windows_reason
+        details = getattr(error, 'windows_selection', None)
+        if details is not None:
+            error.connection_failure['windows_selection'] = details
+        if getattr(error, 'winerror', None) is not None:
+            error.connection_failure['winerror'] = error.winerror
+        raise
+
+
+def open_for_acquisition(usb, identity, *, selected_identity, stage, aoa_control_complete=False):
+    with acquisition_stage(stage, selected_identity, aoa_control_complete=aoa_control_complete):
+        return usb.open_exact(identity)
 
 
 @dataclass(frozen=True)
@@ -187,6 +255,7 @@ class LibUSB:
         if not path:
             raise RuntimeError('libusb 1.0 library unavailable')
         self.library = str(path)
+        self._verify_winusb_accessory = sys.platform == 'win32'
         self.lib = C.CDLL(path)
         signatures = {
             'libusb_init': ([C.POINTER(C.c_void_p)], C.c_int),
@@ -207,6 +276,10 @@ class LibUSB:
             'libusb_get_string_descriptor_ascii': ([C.c_void_p, C.c_uint8, C.POINTER(C.c_ubyte), C.c_int], C.c_int),
             'libusb_bulk_transfer': ([C.c_void_p, C.c_ubyte, C.POINTER(C.c_ubyte), C.c_int, C.POINTER(C.c_int), C.c_uint], C.c_int),
         }
+        if self._verify_winusb_accessory:
+            # libusb >=1.0.30, default Windows backend: the DEVINST of this
+            # exact device. Bus numbers are libusb's own, not PnP bus numbers.
+            signatures['libusb_get_session_data'] = ([C.c_void_p], C.c_ulong)
         for name, (args, result) in signatures.items():
             function = getattr(self.lib, name)
             function.argtypes, function.restype = args, result
@@ -244,6 +317,8 @@ class LibUSB:
         result = {'identity': asdict(ident), 'physical_key': ident.physical_key, 'usb_bcd': desc.bcdUSB, 'device_bcd': desc.bcdDevice,
                   'endpoint0_max_packet': 512 if desc.bcdUSB >= 0x300 else desc.bMaxPacketSize0,
                   'serial_index': desc.iSerialNumber, 'interfaces': []}
+        if getattr(self, '_verify_winusb_accessory', False):
+            result['windows_devinst'] = self.lib.libusb_get_session_data(device)
         config = C.POINTER(_Config)()
         rc = self.lib.libusb_get_active_config_descriptor(device, C.byref(config))
         if rc < 0:
@@ -276,19 +351,41 @@ class LibUSB:
         array, count = self._list()
         try:
             described = [self._describe(array[n]) for n in range(count)]
-            selected = select_exact(described, identity)
+            try:
+                selected = select_exact(described, identity)
+            except ValueError as error:
+                if not identity.ports:
+                    raise
+                candidates = [d['identity'] for d in described if d['identity']['bus'] == identity.bus
+                              and tuple(d['identity']['ports']) == identity.ports]
+                observed = USBIdentity(**candidates[0]) if len(candidates) == 1 else None
+                raise USBEnumerationChanged(str(error) + '; refresh and select the device again', observed) from error
+            actual = USBIdentity(**{**selected['identity'], 'ports': tuple(selected['identity']['ports'])})
+            if identity.address and actual.address != identity.address:
+                raise USBEnumerationChanged('Selected USB address changed before open; refresh and select the device again', actual)
+            if (getattr(self, '_verify_winusb_accessory', False) and
+                    (actual.vid, actual.pid) in ((0x18d1, 0x2d00), (0x18d1, 0x2d01))):
+                # libusb can label an ADB child without MI_xx as interface 0.
+                # Retain and use the exact WinUSB handle whose pipes we verify.
+                from .windows_accessory import open_accessory
+                return open_accessory(identity, selected)
             n = described.index(selected)
             handle = C.c_void_p()
             rc = self.lib.libusb_open(array[n], C.byref(handle))
             if rc < 0:
-                raise USBError('open selected device', rc)
+                raise USBError('open selected device', rc, attempted_identity=actual)
             opened = USBHandle(self, handle, identity, selected)
             if identity.serial_sha256:
                 try:
                     if opened.serial_sha256() != identity.serial_sha256:
                         raise RecoveryBlocked('Selected physical USB device serial mismatch')
-                except Exception:
-                    opened.close()
+                except Exception as error:
+                    error.attempted_identity = actual
+                    try:
+                        opened.close()
+                    except Exception as cleanup:
+                        if hasattr(error, 'add_note'):
+                            error.add_note(f'USB handle.close: {type(cleanup).__name__[:80]}')
                     raise
             return opened
         finally:

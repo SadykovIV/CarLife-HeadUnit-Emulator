@@ -209,7 +209,11 @@ class HIDKeyboard:
                 or not callable(getattr(handle, 'hid_control', None))):
             return cls(unavailable_reason='AOA HID keyboard is available only over native USB; CarLife TCP has no text channel')
         protocol = getattr(stream, 'evidence', {}).get('aoa_version')
-        return cls(handle, aoa_protocol=protocol if type(protocol) is int and protocol in (1, 2) else None)
+        keyboard = cls(handle, aoa_protocol=protocol if type(protocol) is int and protocol in (1, 2) else None)
+        before_close = getattr(stream, 'add_close_callback', None)
+        if callable(before_close):
+            before_close(keyboard.close)
+        return keyboard
 
     def snapshot(self):
         with self.condition:
@@ -283,6 +287,12 @@ class HIDKeyboard:
                     # unregister. A timeout/IO interruption may have registered
                     # it; make one unregister attempt, never replay REGISTER.
                     self.registration_uncertain = error.code in (-1, -7, -10)
+                    raise
+                except Exception as error:
+                    # Native WinUSB preserves the real Win32 completion
+                    # instead of inventing a libusb status. If REGISTER may
+                    # have arrived, retire its ID once without replaying it.
+                    self.registration_uncertain = bool(getattr(error, 'request_may_have_run', False))
                     raise
                 self.registered = True
                 self.protocol = 2

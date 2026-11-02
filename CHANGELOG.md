@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.2-rc.3](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/tag/v0.3.2-rc.3) — 2026-11-02 (prerelease)
+
+- Add an instrument cluster showing the next maneuver, distance, track and artist from CarLife subscriptions. A local driving demo exercises the same messages without a phone or car.
+- Verify the actual Windows accessory interface and bulk endpoints before exchanging data. Offer a confirmed setup helper for an eligible `18d1:2d01` CarLife `MI_00`; leave working bindings and the separate ADB interface alone.
+- Keep the selected USB port when the phone re-enumerates. Diagnostics and JSON export now identify the current connection attempt and its original error, even after a previous successful session.
+
 ## 0.3.1 — 2026-10-26
 
 First GitHub release of the standalone **CarLife HeadUnit Emulator**, extracted from the desktop application in [Carlife_on_box](https://github.com/SadykovIV/Carlife_on_box).
@@ -16,7 +22,7 @@ First GitHub release of the standalone **CarLife HeadUnit Emulator**, extracted 
 - Retain the QtNetwork Python binding required by QtMultimedia in the Windows package, including dependencies loaded dynamically through Shiboken.
 - Mark intentional demo shutdown before closing the client connection so Windows loopback aborts during teardown do not report a successful demo as failed.
 
-The current macOS arm64 package requires macOS 26+. Both packaged applications passed native GUI demos with clean shutdown; Windows libraries and its executable were checked on a Windows 2025 GitHub runner. Physical Windows USB and audio output remain unverified. A source run with one HeadSwap device confirmed USB negotiation, video and HID registration/cleanup. Physical HID text delivery remains unverified. See the [validation history and limits](docs/MAC_HEADUNIT_APP.md#проверка-готовой-сборки).
+The 0.3.1 macOS arm64 package requires macOS 26+. Both 0.3.1 packages passed native GUI demos with clean shutdown; the Windows package was checked on a Windows 2025 GitHub runner. Those tests did not cover physical Windows USB or audio output. A source run with one HeadSwap device confirmed USB negotiation, video and HID registration/cleanup; physical HID text delivery was not verified. See the [validation history and limits](docs/MAC_HEADUNIT_APP.md#проверка-готовой-сборки).
 
 ## 0.3.0 — 2026-10-25
 

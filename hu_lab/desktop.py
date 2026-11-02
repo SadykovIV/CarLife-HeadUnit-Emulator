@@ -1,7 +1,6 @@
 """Cross-platform HeadUnit desktop application. UI and audio stay on the Qt main thread."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 import math
@@ -16,21 +15,79 @@ from PySide6.QtCore import Qt, QEvent, QPointF, QRectF, QTimer, QUrl
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QImage, QEventPoint, QKeySequence, QPainter, QPalette, QPixmap, QTransform
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-    QLineEdit, QMainWindow, QPlainTextEdit, QPushButton, QScrollArea, QSlider,
+    QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSlider,
     QSpinBox, QSplitter, QTabBar, QStackedWidget, QVBoxLayout, QWidget)
 from .desktop_audio import DesktopAudioPlayer
+from .desktop_cluster import ClusterPage
 from .desktop_session import DesktopConfig, create_client, list_usb_devices
 from .desktop_demo import DemoPeer
 from .desktop_input import DesktopTouchInput
+from .desktop_theme import stylesheet
 from .keyboard_input import HIDKeyboard, qt_keyboard_command
 from .geometry import Rect, ViewportTransform
 from .touch import two_pointer_gesture
+from .usb import USBError, USBIdentity
+from .windows_driver_setup import inspect_setup, apply_setup
 from .frame_wake import FrameWake
 from .macos_activity import UserInitiatedActivity
 
-VERSION = "0.3.1"
+VERSION = "0.3.2-rc.3"
 
-from .desktop_theme import stylesheet
+
+def _windows_driver_ui():
+    return sys.platform == 'win32'
+
+def _usb_label(identity):
+    if not identity:
+        return 'не определено'
+    ports = '.'.join(map(str, identity['ports']))
+    return f"{identity['vid']:04x}:{identity['pid']:04x} (порт {identity['bus']}:{ports}, адрес {identity['address']})"
+
+
+class _ConnectionAttemptFailed(Exception):
+    """Carry the failed attempt's own report from the connection worker to Qt."""
+    def __init__(self, report):
+        self.report = report
+        detail = report['connection_failure']
+        stage = detail['stage']
+        message = report['error']
+        issue = detail.get('selection_reason')
+        if issue == 'adb_only':
+            message = ('Через WinUSB доступен только ADB. Для CarLife нужен отдельный '
+                       'интерфейс аксессуара 0 с драйвером WinUSB.')
+        elif issue in ('no_winusb', 'no_verified_accessory'):
+            message = ('Windows не предоставила доступный WinUSB-интерфейс CarLife с нужными '
+                       'каналами. Подробности — в отчёте этой попытки.')
+        elif issue == 'cannot_open':
+            message = 'Не удалось открыть интерфейс WinUSB выбранного устройства. Код Windows — в отчёте.'
+        elif issue == 'device_changed':
+            message = 'Выбранное USB-устройство изменилось. Обновите список и выберите его заново.'
+        elif issue in ('ambiguous', 'enumeration_failed'):
+            message = 'Windows не смогла подтвердить принадлежность интерфейса выбранному устройству. Обновите список.'
+        elif stage == 'post_aoa_wait' and detail.get('aoa_control_complete'):
+            message = 'После запроса перехода в AOA аксессуар не обнаружен на выбранном порту. Обновите список USB.'
+        elif detail.get('reason') == 'enumeration_changed':
+            message = 'Выбранное USB-устройство изменилось или недоступно. Обновите список и выберите его заново.'
+        elif stage in ('preflight_discovery', 'preflight_selection', 'native_discovery'):
+            message = 'Не удалось найти выбранное USB-устройство. Обновите список и проверьте выбранный порт.'
+        elif stage == 'aoa_control':
+            message = 'Не удалось завершить запрос переключения в AOA. Проверьте USB-подключение и обновите список.'
+        elif detail.get('operation') and detail.get('attempted_identity'):
+            step = {
+                'preflight_normal_open': 'до перехода в AOA', 'native_normal_open': 'до перехода в AOA',
+                'preflight_accessory_open': 'в режиме AOA', 'native_accessory_open': 'в режиме AOA',
+                'post_aoa_accessory_open': 'после перехода в AOA', 'accessory_claim': 'при захвате интерфейса AOA',
+            }.get(stage, '')
+            target = detail['attempted_identity']
+            device = f"{target['vid']:04x}:{target['pid']:04x}"
+            code = detail.get('name') or detail.get('code')
+            message = f'USB {device}: ошибка {step} ({code}). Обновите список устройств.'
+            if report['platform'] == 'win32' and detail.get('code') in (-3, -5, -12):
+                message += ' Проверьте драйвер этого интерфейса в диспетчере устройств Windows.'
+        selection = (detail.get('windows_selection') or {}).get('target') or detail.get('selected_identity') or {}
+        if issue in ('adb_only', 'no_winusb', 'no_verified_accessory') and selection.get('pid') == 0x2d01:
+            message += ' Откройте «Подключение» → «Настроить WinUSB…».'
+        super().__init__(message)
 
 
 
@@ -493,6 +550,9 @@ class HeadUnitWindow(QMainWindow):
         self.audio_tab()
         self.body.addWidget(self.splitter)
 
+        self.cluster = ClusterPage(self.start_cluster_demo)
+        self.body.addWidget(self.cluster)
+        self.cluster_tab = self.tabs.addTab('Приборка')
         diagnostics = QWidget()
         details = QVBoxLayout(diagnostics)
         details.setContentsMargins(24, 12, 24, 20)
@@ -510,6 +570,7 @@ class HeadUnitWindow(QMainWindow):
         details.addWidget(self.log, 1)
         details.addWidget(label('USB AOA · H.264 · MEDIA / TTS / VR · журнал и снимки сохраняются в папке сессии', 'muted', True))
         self.body.addWidget(diagnostics)
+        self.diagnostics = diagnostics
         self.tabs.addTab('Диагностика')
         layout.addWidget(self.body, 1)
         self.state = label('●  Отключено', 'footer')
@@ -569,11 +630,25 @@ class HeadUnitWindow(QMainWindow):
     def tab_changed(self, index):
         self.cancel_typing()
         self.video.cancel('tab_changed')
-        diagnostics = index == self.tabs.count() - 1
-        self.body.setCurrentIndex(1 if diagnostics else 0)
-        self.inspector.setVisible(index not in (0, self.tabs.count() - 1))
+        if index == self.cluster_tab:
+            self.body.setCurrentWidget(self.cluster)
+            self.refresh_cluster()
+        else:
+            self.body.setCurrentWidget(self.diagnostics if index == self.tabs.count() - 1 else self.splitter)
+        self.inspector.setVisible(1 <= index <= self.inspector.count())
         if 1 <= index <= self.inspector.count():
             self.inspector.setCurrentIndex(index - 1)
+
+    def start_cluster_demo(self):
+        if self.closing or self.busy or self.client:
+            return
+        self.transport.setCurrentIndex(self.transport.findData('demo'))
+        self.connect_session()
+
+    def refresh_cluster(self):
+        cluster = getattr(self.client.session, 'cluster', None) if self.client else None
+        self.cluster.refresh(cluster, demo=self.demo is not None)
+        self.cluster.demo_button.setEnabled(not self.busy and not self.client and not self.closing)
 
     def tab(self, title):
         page = QWidget()
@@ -597,6 +672,14 @@ class HeadUnitWindow(QMainWindow):
         layout.addWidget(label('Профиль протокола', 'muted'))
         layout.addWidget(self.profile)
         layout.addWidget(label('Устройство выбирается сверху. Режим USB AOA включается при подключении автоматически.', 'muted', True))
+        self.driver_group = QGroupBox('Драйвер Windows')
+        driver_box = QVBoxLayout(self.driver_group)
+        self.driver_status = label('Если Windows видит только ADB, проверьте настройку интерфейса CarLife.', 'muted', True)
+        driver_box.addWidget(self.driver_status)
+        self.driver_button = button('Настроить WinUSB…', self.setup_windows_driver)
+        driver_box.addWidget(self.driver_button)
+        self.driver_group.setVisible(_windows_driver_ui() and self.transport.currentData() == 'usb')
+        layout.addWidget(self.driver_group)
         self.demo_group = QGroupBox('Встроенный тест')
         box = QVBoxLayout(self.demo_group)
         box.addWidget(label('Локальный видеопоток и звук для проверки приложения без устройства.', 'muted', True))
@@ -823,10 +906,10 @@ class HeadUnitWindow(QMainWindow):
             self.show_error(error)
             return False
 
-    def submit(self, work, done):
+    def submit(self, work, done, on_error=None):
         self.busy = True
         self.refresh_buttons()
-        self.pending.append((self.executor.submit(work), done))
+        self.pending.append((self.executor.submit(work), done, on_error))
 
     def transport_changed(self):
         if not hasattr(self, 'tcp_group'): return
@@ -835,6 +918,65 @@ class HeadUnitWindow(QMainWindow):
         self.tcp_group.setVisible(kind == 'tcp')
         self.demo_group.setVisible(kind == 'demo')
         self.demo_header.setVisible(kind == 'demo')
+        if hasattr(self, 'driver_group'):
+            self.driver_group.setVisible(_windows_driver_ui() and kind == 'usb')
+
+    def _confirm_driver_setup(self, plan):
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle('Настройка WinUSB')
+        dialog.setIcon(QMessageBox.Icon.Question)
+        register = plan.action == 'register'
+        dialog.setText('Зарегистрировать интерфейс CarLife?' if register else
+                       'Назначить системный драйвер Microsoft WinUSB интерфейсу CarLife?')
+        dialog.setInformativeText(f'Устройство: 18D1:2D01, порт {plan.identity.physical_key}.\n'
+                                  f'Интерфейс: {plan.target.hardware_id}.\n\n'
+                                  + ('WinUSB уже назначен. Будет зарегистрирован путь доступа для приложений.'
+                                     if register else 'Текущий драйвер этого интерфейса может быть заменён.')
+                                  + ' Windows может запросить права администратора для помощника.')
+        install = dialog.addButton('Зарегистрировать' if register else 'Назначить WinUSB',
+                                   QMessageBox.ButtonRole.AcceptRole)
+        cancel = dialog.addButton('Отмена', QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(cancel)
+        dialog.setEscapeButton(cancel)
+        dialog.exec()
+        return dialog.clickedButton() is install
+
+    def setup_windows_driver(self):
+        if not _windows_driver_ui() or self.busy or self.client or self.closing or self.transport.currentData() != 'usb':
+            return
+        def note(text):
+            self.driver_status.setText(text)
+            self.log_event('WinUSB: ' + text)
+        def failure(error):
+            note(str(error))
+        def finished(outcome):
+            note({'ready':'Интерфейс CarLife проверен. Можно нажать «Подключить».',
+                  'cancelled':'Настройка отменена.',
+                  'reboot':'Windows запросила перезагрузку. После неё снова проверьте интерфейс.',
+                  'reconnect':'Доступ к каналам ещё не подтверждён. Переподключите телефон и повторите проверку.'
+                 }.get(outcome,'Настройка не подтверждена. Проверьте состояние интерфейса.'))
+            if self.closing:
+                self.close()
+            elif outcome not in ('cancelled','reboot'):
+                self.refresh_usb()
+        def checked(plan):
+            if self.closing:
+                self.close()
+            elif plan.action == 'ready':
+                note('Интерфейс CarLife уже доступен через WinUSB. Ничего устанавливать не нужно.')
+            elif self._confirm_driver_setup(plan) and not self.closing:
+                note('Ожидание ответа Windows…')
+                self.submit(lambda: apply_setup(plan), finished, on_error=failure)
+            else:
+                note('Настройка отменена. Драйверы не изменены.')
+        item = self.usb_devices.currentData()
+        if not item:
+            note('Сначала выберите телефон в списке USB.')
+            return
+        identity = USBIdentity(**{**item, 'ports':tuple(item['ports'])})
+        self.error_label.hide()
+        note('Проверка выбранного устройства…')
+        self.submit(lambda: inspect_setup(identity), checked, on_error=failure)
 
     def preset_changed(self):
         dimensions = self.presets.currentData()
@@ -850,15 +992,30 @@ class HeadUnitWindow(QMainWindow):
     def refresh_usb(self):
         if self.busy or self.client: return
         def done(devices):
-            previous = self.usb_devices.currentData()
+            previous = self.usb_devices.currentData() or getattr(self, 'last_usb_selection', None)
+            self.last_usb_selection = previous
             self.usb_devices.clear()
             for item in devices:
                 suffix = ' • AOA' if item.get('desktop_supported') else ' • требуется AOA'
                 self.usb_devices.addItem(item['label']+suffix,item['identity'])
             if not self.usb_devices.count(): self.usb_devices.addItem('USB-устройств не найдено',None)
             if previous:
+                matched = False
                 for n in range(self.usb_devices.count()):
-                    if self.usb_devices.itemData(n) == previous: self.usb_devices.setCurrentIndex(n)
+                    item = self.usb_devices.itemData(n)
+                    # AOA recovery changes address and VID/PID. Keep the
+                    # operator's physical port selected, never another device
+                    # merely because it sorted first. This only updates the
+                    # picker; the next explicit connect revalidates identity.
+                    if item and (item == previous or (previous.get('ports') and
+                            (item.get('bus'), tuple(item.get('ports', ()))) ==
+                            (previous.get('bus'), tuple(previous['ports'])))):
+                        self.usb_devices.setCurrentIndex(n)
+                        matched = True
+                        break
+                if not matched:
+                    self.usb_devices.insertItem(0, 'Выбранное устройство переподключается • обновите список', None)
+                    self.usb_devices.setCurrentIndex(0)
             self.log_event(f'USB: устройств {len(devices)}, готовых AOA: {sum(bool(d.get("desktop_supported")) for d in devices)}')
         self.submit(list_usb_devices, done)
 
@@ -905,24 +1062,46 @@ class HeadUnitWindow(QMainWindow):
 
     def connect_session(self):
         if self.busy or self.client or self.closing: return
+        started_at = datetime.now(timezone.utc)
+        started = time.monotonic()
+        kind = self.transport.currentData()
+        configuration_error = None
         try: config = self.configuration()
-        except Exception as error: self.show_error(error); return
+        except Exception as error:
+            config, configuration_error = None, error
         self.error_label.hide()
-        try:
-            self.save_settings()
-        except OSError as error:
-            self.show_error(f'Настройки не сохранены: {error}')
-        self.audio.reset()
-        activity = self.activity.start()
-        if activity['status'] == 'failed':
-            self.log_event('Защита от App Nap недоступна: ' + str(activity['error']))
-        ingress = AudioIngress(self.audio)
+        ingress = None
+        if config is not None:
+            try:
+                self.save_settings()
+            except OSError as error:
+                self.show_error(f'Настройки не сохранены: {error}')
+            self.audio.reset()
+            activity = self.activity.start()
+            if activity['status'] == 'failed':
+                self.log_event('Защита от App Nap недоступна: ' + str(activity['error']))
+            ingress = AudioIngress(self.audio)
         self.ingress = ingress
-        demo_mode = self.transport.currentData() == 'demo'
+        demo_mode = kind == 'demo'
         tone = self.demo_tone.isChecked()
         hid_enabled = self.hid_enabled.isChecked()
-        self.last_run = self.data_dir / 'sessions' / datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
+        self.last_run = self.data_dir / 'sessions' / started_at.strftime('%Y%m%dT%H%M%S.%fZ')
         output = self.last_run
+        selected = None
+        item = self.usb_devices.currentData() if kind == 'usb' else None
+        if item:
+            try:
+                selected = dict(bus=item['bus'], ports=list(item['ports']), vid=item['vid'], pid=item['pid'],
+                                address=item['address'], vid_pid=f"{item['vid']:04x}:{item['pid']:04x}")
+            except (KeyError, TypeError, ValueError):
+                pass  # No complete picker identity to report; do not guess one.
+        attempt = dict(application='CarLife HeadUnit Emulator', version=VERSION, platform=sys.platform,
+                       architecture=platform.machine(), attempt_id=output.name, session_id=None,
+                       state='CONNECTING', started_at=started_at.isoformat(), error=None, demo=demo_mode,
+                       transport=kind, profile=self.profile.currentData(),
+                       backend='DIRECT_USB_AOA' if kind == 'usb' else 'TCP_STREAM',
+                       selected_identity=selected, decoded_frames=0)
+        self.last_report = attempt
         self.log_event('Подключение…')
         self.state.setText('●  Подключение…')
         def work():
@@ -930,30 +1109,72 @@ class HeadUnitWindow(QMainWindow):
             peer = None
             client = None
             keyboard = None
+            stage = 'configuration'
             try:
+                if configuration_error is not None:
+                    raise configuration_error
+                stage = 'create_client'
                 if demo_mode:
                     peer = DemoPeer(tone=tone, touch_profile=config.touch_profile)
                     local_config = replace(config, host='127.0.0.1',port=peer.port)
                 else: local_config = config
                 client = create_client(local_config, output, audio_sink=ingress,
                                        on_frame_available=self.frame_wake.notify)
+                stage = 'start_client'
                 client.start()
+                stage = 'start_keyboard'
                 keyboard = HIDKeyboard.for_client(client) if hid_enabled else HIDKeyboard(unavailable_reason='USB-клавиатура отключена в настройках')
                 # Optional HID must not issue control requests while Android
                 # is opening the accessory and negotiating the CarLife stream.
                 if not hid_enabled or client.backend != 'DIRECT_USB_AOA':
                     keyboard.start()
                 return client, peer, keyboard
-            except Exception:
-                ingress.close()
-                if keyboard: keyboard.close()
-                self.activity.close()
-                try:
-                    if peer: peer.begin_close()
-                    if client: client.stop()
-                finally:
-                    if peer: peer.close()
-                raise
+            except Exception as error:
+                detail = dict(getattr(error, 'connection_failure', None) or {})
+                detail.setdefault('stage', stage)
+                detail.setdefault('selected_identity', selected)
+                detail.setdefault('attempted_identity', None)
+                detail.setdefault('reason', 'usb_error' if isinstance(error, USBError) else 'connection_error')
+                detail['message'] = str(error)
+                for field in ('operation', 'code', 'name'):
+                    detail.setdefault(field, getattr(error, field, None) if isinstance(error, USBError) else None)
+                detail.setdefault('aoa_control_complete', None)  # Unknown unless the transport observed it.
+                cleanup_errors = []
+                report = dict(attempt, state='CONNECTION_FAILED', session_id=client.session_id if client else output.name,
+                              error=str(error) or type(error).__name__, error_type=type(error).__name__, connection_failure=detail,
+                              failed_at=datetime.now(timezone.utc).isoformat(),
+                              elapsed_ms=round((time.monotonic()-started)*1000, 3),
+                              desktop_cleanup_errors=cleanup_errors)
+                def clean(name, fn):
+                    try:
+                        return fn()
+                    except Exception as problem:
+                        cleanup_errors.append(f'{name}: {problem}')
+                if ingress:
+                    clean('Audio input', ingress.close)
+                if keyboard:
+                    stopped = clean('Keyboard', keyboard.close)
+                    if stopped and (stopped.get('worker_alive') or stopped.get('cleanup_errors')):
+                        cleanup_errors.append('Keyboard: ' + str(stopped.get('cleanup_errors') or 'worker did not stop'))
+                if peer:
+                    clean('Demo shutdown', peer.begin_close)
+                if client:
+                    # start() can fail before any worker exists. Its core
+                    # summary must not describe that acquisition as a clean stop.
+                    if client.sock is None and not client.error:
+                        client.error = report['error']
+                        client.session.state = 'ERROR'
+                    clean('Client', client.stop)
+                    report['decoded_frames'] = client.decoded_frames
+                if peer:
+                    clean('Demo', peer.close)
+                clean('Activity', self.activity.close)
+                def save_failure():
+                    output.mkdir(parents=True, exist_ok=True)
+                    (output/'desktop-summary.json').write_text(
+                        json.dumps(report, indent=2, ensure_ascii=False)+'\n', encoding='utf-8')
+                clean('Report', save_failure)
+                raise _ConnectionAttemptFailed(report) from error
         def done(result):
             self.client, self.demo, self.keyboard = result
             self.keyboard_start_future = None
@@ -961,18 +1182,43 @@ class HeadUnitWindow(QMainWindow):
             self.last_keyboard_status = None
             self.update_keyboard_status()
             if config.transport == 'usb':
-                identity = getattr(self.client.sock, 'evidence', {}).get('identity')
+                usb_info = getattr(self.client.sock, 'evidence', {})
+                identity = usb_info.get('identity')
                 if identity:
                     self.usb_devices.setItemData(self.usb_devices.currentIndex(), identity)
                     self.usb_devices.setItemText(self.usb_devices.currentIndex(),
                         f'{identity["vid"]:04x}:{identity["pid"]:04x} • AOA')
+                win = usb_info.get('windows_selection')
+                if win and win.get('verified'):
+                    self.log_event(f"WinUSB: выбран интерфейс {win['verified']['number']}, "
+                                   f"IN 0x{win['expected_in']:02x}, OUT 0x{win['expected_out']:02x}")
             self.last_state = None
             self.video.clear()
             self.notice.setText(('ДЕМО • локальный H.264 + PCM, синтетический MD' if demo_mode else
                 f'{config.transport.upper()} • {config.profile} • {config.width} × {config.height} / {config.fps} fps') + ' • мышь управляет экраном')
             self.log_event(f'Сессия: {output.name}')
             if self.closing: self.disconnect_session()
-        self.submit(work,done)
+        def failed(error):
+            if isinstance(error, _ConnectionAttemptFailed):
+                report = self.last_report = error.report
+                self.history.append({'session_id':report['session_id'], 'error':report['error'], 'demo':report['demo']})
+                detail = report['connection_failure']
+                self.log_event(f"Попытка {report['attempt_id']} • этап: {detail['stage']} • {report['elapsed_ms']:.0f} мс")
+                if kind == 'usb':
+                    self.log_event(f"USB: выбрано {_usb_label(detail['selected_identity'])}; попытка: {_usb_label(detail['attempted_identity'])}")
+                    selection = detail.get('windows_selection')
+                    if selection and selection.get('target'):
+                        self.log_event(f"Поиск интерфейса 0: {_usb_label(selection['target'])}; результат: {detail.get('selection_reason')}")
+                    if detail.get('observed_identity'):
+                        self.log_event(f"Теперь на порту: {_usb_label(detail['observed_identity'])}")
+                self.log_event(f"Причина: {report['error']} (код: {detail.get('code')})" if detail.get('code') is not None
+                               else f"Причина: {report['error']}")
+                for issue in report['desktop_cleanup_errors']:
+                    self.log_event('Завершение попытки: ' + issue)
+                self.ingress = None
+            if config is not None and kind == 'usb' and not self.closing:
+                self.refresh_usb()
+        self.submit(work,done,on_error=failed)
 
     def start_keyboard_when_ready(self):
         client, keyboard = self.client, self.keyboard
@@ -1042,6 +1288,7 @@ class HeadUnitWindow(QMainWindow):
             self.last_report = report
             self.history.append({'session_id':report['session_id'],'error':report['error'],'demo':report['demo']})
             self.client = self.demo = None
+            self.refresh_cluster()
             self.keyboard = None
             self.keyboard_start_future = None
             self.keyboard_start_requested = False
@@ -1057,6 +1304,8 @@ class HeadUnitWindow(QMainWindow):
             if report.get('desktop_cleanup_errors'):
                 self.show_error('; '.join(report['desktop_cleanup_errors']))
             if after: after()
+            elif report['error'] and client.backend == 'DIRECT_USB_AOA' and not self.closing:
+                self.refresh_usb()
             elif self.closing: self.close()
         self.submit(work,done)
 
@@ -1104,6 +1353,10 @@ class HeadUnitWindow(QMainWindow):
             result.update(desktop_audio=self.audio.snapshot(),demo=self.demo is not None,
                           keyboard=self.keyboard.snapshot() if self.keyboard else None)
         else: result = dict(self.last_report or {})
+        if not self.client and result.get('state') in ('CONNECTING', 'CONNECTION_FAILED'):
+            # This snapshot describes one attempt; cumulative UI counters and
+            # history may belong to an earlier, entirely unrelated session.
+            return result
         result.update(application='CarLife HeadUnit Emulator',version=VERSION,architecture=platform.machine(),sessions=self.history,
                       frame_wake=self.frame_wake.snapshot(),macos_activity=self.activity.snapshot())
         return result
@@ -1124,6 +1377,8 @@ class HeadUnitWindow(QMainWindow):
         self.reconnect_button.setEnabled(not self.busy)
         self.apply_button.setEnabled(not self.busy)
         self.scan_button.setEnabled(not connected and not self.busy)
+        if hasattr(self, 'driver_button'):
+            self.driver_button.setEnabled(not connected and not self.busy and not self.closing)
         for widget in (self.transport, self.usb_devices, self.host, self.port, self.profile, self.touch_profile, self.hid_enabled):
             widget.setEnabled(not connected and not self.busy)
         self.reset_button.setEnabled(bool(streaming))
@@ -1156,9 +1411,9 @@ class HeadUnitWindow(QMainWindow):
             except Exception as error:
                 self.log_event(f'Клавиатура: {type(error).__name__}: {error}')
             self.update_keyboard_status()
-        for future, done in list(self.pending):
+        for future, done, on_error in list(self.pending):
             if future.done():
-                self.pending.remove((future,done)); self.busy = False
+                self.pending.remove((future,done,on_error)); self.busy = False
                 try: done(future.result())
                 except Exception as error:
                     self.show_error(error)
@@ -1167,6 +1422,7 @@ class HeadUnitWindow(QMainWindow):
                         self.audio.reset()
                         self.activity.close()
                         self.state.setText('●  Ошибка подключения')
+                    if on_error: on_error(error)
                     if self.closing and not self.client: self.close()
                 self.refresh_buttons()
         client = self.client
@@ -1200,6 +1456,8 @@ class HeadUnitWindow(QMainWindow):
                 self.gesture_due = time.monotonic()+.04
         if time.monotonic() - self.metrics_time > .5:
             self.metrics_time = time.monotonic()
+            if self.tabs.currentIndex() == self.cluster_tab:
+                self.refresh_cluster()
             self.update_keyboard_status()
             audio = self.audio.snapshot()
             lanes = audio.get('lanes',{})

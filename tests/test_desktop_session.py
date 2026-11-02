@@ -11,7 +11,7 @@ from hu_lab import client as client_module
 from hu_lab.client import HUClient
 from hu_lab.audio import MEDIA_INIT, MEDIA_DATA
 from hu_lab.desktop_session import (AccessoryTransportFactory, DesktopConfig,
-    DesktopConnectionError, DesktopV2Session, ExplicitAOATransportFactory,
+    DesktopConnectionError, DesktopV1Session, DesktopV2Session, ExplicitAOATransportFactory,
     HARD_KEYS, create_client, list_usb_devices)
 from hu_lab.honda_reference import (MD_FEATURE_REQUEST, CARLIFE_SUBSCRIBE_DONE, list_body)
 from hu_lab.protocol import (CMD, TOUCH, HARD_KEY, MEDIA, VIDEO, VIDEO_DATA,
@@ -224,7 +224,7 @@ class DesktopSessionTests(unittest.TestCase):
         v2 = self.make_client(DesktopConfig(profile="v2", fps=24))
         v1 = self.make_client()
         self.assertIs(type(v2.session), DesktopV2Session)
-        self.assertIs(type(v1.session), HUSession)
+        self.assertIs(type(v1.session), DesktopV1Session)
         self.assertIs(client_module.HUSession, HUSession)
         self.assertEqual(fields(v2.session.start()[0].payload)[1], 2)
         self.assertEqual(fields(v1.session.start()[0].payload)[1], 1)
@@ -234,13 +234,11 @@ class DesktopSessionTests(unittest.TestCase):
         init = next(p for p in replies if p.message == VIDEO_INIT)
         self.assertEqual(fields(init.payload), {1: 1280, 2: 720, 3: 24})
 
-    def test_v2_accepts_current_metadata_flags_but_rejects_wrong_ids(self):
+    def test_unsolicited_v2_metadata_ack_does_not_start_subscriptions(self):
         session = DesktopV2Session()
         good = list_body([dict(f1=0, f2=1), dict(f1=1, f2=0), dict(f1=2, f2=1)])
         self.assertEqual(session.receive(Packet(CMD, CARLIFE_SUBSCRIBE_DONE, good)), [])
-        for values in ([dict(f1=0, f2=1)], [dict(f1=0, f2=2), dict(f1=1, f2=0), dict(f1=2, f2=1)]):
-            with self.assertRaises(ProtocolError):
-                session.receive(Packet(CMD, CARLIFE_SUBSCRIBE_DONE, list_body(values)))
+        self.assertEqual(session.cluster.snapshot()['subscriptions']['navigation']['state'], 'idle')
 
     def test_resolution_fallback_is_explicit(self):
         for allow in (False, True):
@@ -257,6 +255,48 @@ class DesktopSessionTests(unittest.TestCase):
                 with self.assertRaisesRegex(ProtocolError, "dimensions differ"):
                     session.receive(accepted)
                 self.assertIsNone(session.accepted)
+
+    def test_desktop_fallback_keeps_request_and_uses_accepted_geometry_on_reconnect(self):
+        for profile in ("v1", "honda-v2"):
+            with self.subTest(profile=profile):
+                config = DesktopConfig(profile=profile, width=1920, height=1080, fps=60)
+                self.assertTrue(config.allow_mode_fallback)
+                clients = []
+                for _ in range(2):
+                    client = self.make_client(config)
+                    clients.append(client)
+                    session = client.session
+                    requested = dict(session.requested)
+                    session.start()
+                    replies = session.receive(Packet(CMD, VERSION_MATCH, protobuf(f1=1)))
+                    if profile == "honda-v2":
+                        replies = session.receive(Packet(CMD, MD_FEATURE_REQUEST))
+                    init = next(packet for packet in replies if packet.message == VIDEO_INIT)
+                    self.assertEqual(fields(init.payload), {1: 1920, 2: 1080, 3: 60})
+                    session.receive(Packet(CMD, VIDEO_INIT_DONE, protobuf(f1=1280, f2=720, f3=30)))
+                    self.assertEqual(session.state, "STREAMING")
+                    self.assertEqual((session.width, session.height, session.fps), (1280, 720, 30))
+                    self.assertEqual(client.geometry["requested_video"], requested)
+                    self.assertEqual(tuple(requested[key] for key in ("width", "height", "fps")),
+                                     (1920, 1080, 60))
+                    self.assertEqual(client.geometry["accepted_video"]["width"], 1280)
+                    self.assertEqual(client.geometry["accepted_video"]["fps"], 30)
+                    self.assertTrue(client.input_content_contains(1279, 719))
+                    self.assertFalse(client.input_content_contains(1280, 719))
+                    self.assertFalse(client.input_content_contains(1279, 720))
+                self.assertIsNot(clients[0].session, clients[1].session)
+                self.assertEqual((config.width, config.height, config.fps), (1920, 1080, 60))
+
+    def test_desktop_explicit_strict_mode_and_lab_default_still_reject_different_dimensions(self):
+        client = self.make_client(DesktopConfig(
+            profile="v1", width=1920, height=1080, fps=30, allow_mode_fallback=False))
+        for session in (client.session, HUSession(1920, 1080, 30)):
+            session.start()
+            session.receive(Packet(CMD, VERSION_MATCH, protobuf(f1=1)))
+            with self.assertRaisesRegex(ProtocolError, "requested 1920x1080, received 1280x720"):
+                session.receive(Packet(CMD, VIDEO_INIT_DONE, protobuf(f1=1280, f2=720, f3=30)))
+            self.assertIsNone(session.accepted)
+            self.assertEqual(session.requested["width"], 1920)
 
     def test_tcp_lan_opt_in_does_not_weaken_existing_dev_transport(self):
         client = self.make_client(DesktopConfig(host="192.0.2.5", port=7240))

@@ -12,13 +12,13 @@ from pathlib import Path
 import sys
 
 from .client import HUClient
-from .honda_reference import (HondaReferenceSession, CARLIFE_SUBSCRIBE_DONE,
-                              repeated_entries)
+from .cluster import DesktopClusterSession
+from .honda_reference import HondaReferenceSession
 from .honda_reference_client import HondaReferenceClient
 from .native_usb import ACCESSORY_IDS, USBStream
 from .protocol import (HUSession, Packet, ProtocolError, TOUCH, HARD_KEY, protobuf)
 from .touch import profile_name
-from .usb import LibUSB, USBIdentity, select_exact, select_bulk_pair
+from .usb import LibUSB, USBIdentity, acquisition_stage, open_for_acquisition, select_exact, select_bulk_pair
 from .platform_support import bundled_libusb, lock_owner, open_owner_lock, usb_lock_directory
 
 
@@ -134,10 +134,11 @@ class AccessoryTransportFactory:
             except ValueError as error:
                 raise DesktopConnectionError("The selected accessory is unavailable; refresh the USB device list") from error
             _validate_descriptor(selected, identity)
-            handle = usb.open_exact(identity)
+            handle = open_for_acquisition(usb, identity, selected_identity=identity, stage="native_accessory_open")
             # Revalidate the second enumeration made by open_exact before claim.
             _validate_descriptor(handle.descriptor, identity)
-            handle.claim_accessory(_AccessoryClaimAdmission(identity))
+            with acquisition_stage("accessory_claim", identity, attempted_identity=identity):
+                handle.claim_accessory(_AccessoryClaimAdmission(identity))
             owner.seek(0)
             owner.truncate()
             owner.write(json.dumps({"pid": os.getpid(), "physical_key": identity.physical_key,
@@ -146,6 +147,8 @@ class AccessoryTransportFactory:
             evidence = {"backend": "DIRECT_USB_AOA", "identity": asdict(identity),
                         "bulk_pair": asdict(handle.pair), "entry": "ALREADY_ACCESSORY",
                         "mode_switch_requested": False, "adb_data_plane": False}
+            if getattr(handle, 'windows_selection', None) is not None:
+                evidence['windows_selection'] = handle.windows_selection
             return USBStream(usb, handle, owner, evidence)
         except BaseException:
             try:
@@ -196,7 +199,9 @@ class DesktopConfig:
     touch_profile: str = "legacy-single"
     audio_capture: bool = False
     trace_mode: str = "sampled"
-    allow_mode_fallback: bool = False
+    # Normal desktop connections negotiate the mode offered by the MD. Tests
+    # that require exact dimensions can still opt into the strict lab policy.
+    allow_mode_fallback: bool = True
     aoa_start: bool = False
 
     def validate(self):
@@ -225,7 +230,11 @@ class DesktopConfig:
         return self
 
 
-class DesktopV2Session(HondaReferenceSession):
+class DesktopV1Session(DesktopClusterSession, HUSession):
+    pass
+
+
+class DesktopV2Session(DesktopClusterSession, HondaReferenceSession):
     """V2 test profile with current metadata and requested video frame rate.
 
     This extends the historical Honda fixture, rather than claiming exact Honda
@@ -239,16 +248,6 @@ class DesktopV2Session(HondaReferenceSession):
         super().__init__(width, height, fps, subscribe_ids=(0, 1, 2), **kwargs)
         self.wire_fps = fps
         self.requested.update(wire_fps=fps, provenance="explicit desktop V2 test request")
-
-    def receive(self, packet):
-        if packet.message == CARLIFE_SUBSCRIBE_DONE:
-            entries = repeated_entries(packet.payload)
-            if [e[1] for e in entries] != list(self.subscribe_ids) or any(e.get(2) not in (0, 1) for e in entries):
-                raise ProtocolError("V2 metadata subscription must echo requested IDs and boolean support flags")
-            self.reference_events.append({"event": "current_metadata_support", "entries": entries})
-            return []
-        return super().receive(packet)
-
 
 # CarLife key enum from the pinned fgrcwp/apollo ServiceTypes.kt, not Android
 # KeyEvent codes. MEDIA_STOP is pause for HeadSwap's AA bridge; other MDs may stop.
@@ -304,7 +303,7 @@ def create_client(config, output_dir, audio_sink=None, on_decoded_frame=None, on
     return client_type(config.host, config.port, output_dir, config.width, config.height, config.fps,
                        backend="DIRECT_USB_AOA" if usb else "TCP_STREAM",
                        transport_factory=transport_factory,
-                       session_factory=DesktopV2Session if v2 else HUSession,
+                       session_factory=DesktopV2Session if v2 else DesktopV1Session,
                        touch_profile=config.touch_profile, trace_mode=config.trace_mode,
                        allow_mode_fallback=config.allow_mode_fallback,
                        audio_capture=config.audio_capture, on_decoded_frame=on_decoded_frame,

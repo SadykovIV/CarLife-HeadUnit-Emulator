@@ -6,7 +6,7 @@ on:
       tag:
         description: Release tag whose Windows ZIP should be tested
         required: true
-        default: v0.3.1
+        default: v0.3.2-rc.3
         type: string
       expected_sha256:
         description: Expected SHA256 of the complete Windows ZIP
@@ -37,10 +37,10 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           Set-StrictMode -Version Latest
-          if ($env:RELEASE_TAG -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
-            throw 'Tag must have the form vX.Y.Z.'
+          if ($env:RELEASE_TAG -cnotmatch '\Av(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-rc\.[1-9][0-9]*)?\z') {
+            throw 'Tag must have the form vX.Y.Z or vX.Y.Z-rc.N.'
           }
-          if ($env:EXPECTED_SHA256 -notmatch '^[0-9a-fA-F]{64}$') {
+          if ($env:EXPECTED_SHA256 -notmatch '\A[0-9a-fA-F]{64}\z') {
             throw 'Expected SHA256 must be exactly 64 hexadecimal characters.'
           }
           $version = $env:RELEASE_TAG.Substring(1)
@@ -54,7 +54,7 @@ jobs:
           "PACKAGE_ROOT=$work/unpacked/$name" >> $env:GITHUB_ENV
           "SMOKE_ROOT=$smoke" >> $env:GITHUB_ENV
 
-      - name: Download draft asset, verify SHA256 and extract the whole package
+      - name: Download release asset, verify SHA256 and extract the whole package
         timeout-minutes: 3
         env:
           # Keep the token out of the application process environment.
@@ -81,6 +81,12 @@ jobs:
           if ($build.version -ne $env:RELEASE_VERSION -or $build.architecture -ne 'x64') {
             throw 'The packaged version or architecture does not match the requested release.'
           }
+          # The USB runtime probe was introduced in 0.3.2-rc.1.
+          $needsUsbProbe = ([version](($env:RELEASE_VERSION -split '-')[0])) -ge [version]'0.3.2'
+          if ($needsUsbProbe -and -not (Test-Path -LiteralPath "$env:PACKAGE_ROOT/VerifyUsbRuntime.cmd" -PathType Leaf)) {
+            throw 'The release is missing its USB runtime probe.'
+          }
+          "CHECK_USB_RUNTIME=$($needsUsbProbe.ToString().ToLowerInvariant())" >> $env:GITHUB_ENV
 
       - name: Run Verify.cmd with the bundled interpreter and DLLs
         # Start-Process -Wait waits for the launcher and its Python child.
@@ -109,6 +115,44 @@ jobs:
             if (Test-Path -LiteralPath $startup) {
               Copy-Item -LiteralPath $startup -Destination "$env:CHECK_ROOT/logs/verify-startup.log"
             }
+          }
+
+      - name: Check packaged USB libraries without opening a device
+        if: env.CHECK_USB_RUNTIME == 'true'
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $env:TEMP = "$env:CHECK_ROOT/temp"
+          $env:TMP = $env:TEMP
+          $env:LOCALAPPDATA = "$env:CHECK_ROOT/localappdata"
+          $process = Start-Process -FilePath $env:ComSpec -ArgumentList '/d /s /c VerifyUsbRuntime.cmd' -WorkingDirectory $env:PACKAGE_ROOT -Wait -PassThru -RedirectStandardOutput "$env:CHECK_ROOT/logs/usb-runtime.stdout.log" -RedirectStandardError "$env:CHECK_ROOT/logs/usb-runtime.stderr.log"
+          if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) {
+            throw "VerifyUsbRuntime.cmd failed: exit $($process.ExitCode)"
+          }
+          $check = Get-Content -LiteralPath "$env:TEMP/carlife-libusb-check.json" -Raw | ConvertFrom-Json
+          $build = Get-Content -LiteralPath "$env:PACKAGE_ROOT/build-info.json" -Raw | ConvertFrom-Json
+          if ($check.status -ne 'PASS' -or $check.stage -ne 'complete' -or $check.package_version -ne $env:RELEASE_VERSION -or $check.platform -ne 'win32') {
+            throw 'USB runtime probe did not complete for this Windows release.'
+          }
+          if ($check.library_sha256 -ne $build.usb_library.sha256 -or $check.library_version -ne $build.usb_library.version -or $check.resolved_exports -ne @($build.usb_library.required_exports).Count) {
+            throw 'The loaded USB library differs from the packaged manifest.'
+          }
+          if ($check.context_initialized -ne $true -or $check.context_closed -ne $true -or $null -eq $check.device_count -or $check.device_count -lt 0 -or $check.device_open_attempted -ne $false -or $check.interface_claim_attempted -ne $false -or $check.aoa_request_attempted -ne $false) {
+            throw 'The probe did not enumerate and close the context within its read-only scope.'
+          }
+          if ($null -ne $build.PSObject.Properties['driver_setup_helper']) {
+            $helper = Join-Path $env:PACKAGE_ROOT 'CarLifeWinUsbSetup.exe'
+            if ($build.driver_setup_helper.name -cne 'CarLifeWinUsbSetup.exe' -or (Get-FileHash -LiteralPath $helper -Algorithm SHA256).Hash -ne $build.driver_setup_helper.sha256) {
+              throw 'Driver helper hash or filename differs from the manifest.'
+            }
+            # This exact argument binds system APIs and exits before target
+            # parsing; do not request elevation or run an installation mode.
+            $process = Start-Process -FilePath $helper -ArgumentList '--verify-api' -WorkingDirectory $env:PACKAGE_ROOT -Wait -PassThru
+            if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) {
+              throw "Native helper API check failed: exit $($process.ExitCode)"
+            }
+            'Native helper API check: PASS (no device or install).' | Set-Content "$env:CHECK_ROOT/logs/helper-api.log" -Encoding utf8
           }
 
       - name: Run the packaged GUI demo and require clean shutdown
@@ -155,3 +199,4 @@ jobs:
             ${{ runner.temp }}/headunit-smoke/smoke-report.json
             ${{ runner.temp }}/headunit-smoke/smoke-window.png
             ${{ runner.temp }}/headunit-release-check/logs/*.log
+            ${{ runner.temp }}/headunit-release-check/temp/carlife-libusb-check.json

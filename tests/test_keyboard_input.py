@@ -3,6 +3,8 @@ import ctypes
 import json
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+from pathlib import Path
+import tempfile
 import threading
 import time
 from types import SimpleNamespace
@@ -13,6 +15,9 @@ from hu_lab.keyboard_input import (HIDKeyboard, KeyboardInputError,
     KEYBOARD_REPORT_DESCRIPTOR, RELEASE_REPORT, MAX_TEXT_LENGTH, CTRL, SHIFT,
     key_report, text_reports, qt_keyboard_command)
 from hu_lab.usb import USBError, USBHandle, USBIdentity
+from hu_lab.native_usb import USBStream
+from hu_lab.client import HUClient
+from hu_lab.protocol import ProtocolError
 
 
 def wait_for(predicate, timeout=2):
@@ -139,6 +144,85 @@ class KeyboardWorkerTests(unittest.TestCase):
         self.assertTrue(keyboard.start()['available'])
         self.assertEqual(keyboard.snapshot()['aoa_protocol'], 2)
 
+    def session_keyboard(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        class ClaimedHandle(FakeHandle):
+            def hid_control(self, *args, **kwargs):
+                if self.closed:
+                    raise RuntimeError('Accessory interface not claimed')
+                return super().hid_control(*args, **kwargs)
+        handle = ClaimedHandle()
+        stream = USBStream(SimpleNamespace(close=lambda: None), handle,
+                           open(root / 'owner.lock', 'a+'), {})
+        client = HUClient('direct-usb', 0, root / 'session', backend='DIRECT_USB_AOA',
+                          transport_factory=lambda: stream)
+        client.sock = stream  # Deliberately no socket, device, or client workers.
+        self.addCleanup(client.stop)
+        keyboard = HIDKeyboard.for_client(client)
+        self.addCleanup(keyboard.close)
+        return client, keyboard, stream, handle
+
+    def test_protocol_failure_retires_keyboard_before_usb_handle_is_closed(self):
+        client, keyboard, stream, handle = self.session_keyboard()
+        self.assertTrue(keyboard.start()['available'])
+        def mismatch():
+            raise ProtocolError('video mode mismatch fixture')
+        client._guard(mismatch)
+        self.assertEqual(client.error, 'ProtocolError: video mode mismatch fixture')
+        self.assertTrue(stream.closed)
+        self.assertTrue(handle.closed)
+        self.assertEqual([call[0] for call in handle.calls[-2:]], [57, 55])
+        self.assertEqual(handle.calls[-2][3], RELEASE_REPORT)
+        state = keyboard.close()  # The later GUI cleanup is idempotent.
+        self.assertEqual(state['status'], 'closed')
+        self.assertFalse(state['worker_alive'])
+        self.assertFalse(state['registered'])
+        self.assertEqual(state['cleanup_errors'], [])
+
+    def test_keyboard_created_after_failure_cannot_start_on_retired_usb(self):
+        client, keyboard, stream, handle = self.session_keyboard()
+        stream.close()
+        late = HIDKeyboard.for_client(client)
+        self.addCleanup(late.close)
+        self.assertEqual(late.start()['status'], 'closed')
+        self.assertFalse(late.snapshot()['available'])
+        self.assertEqual(handle.calls, [])
+        self.assertEqual(keyboard.snapshot()['cleanup_errors'], [])
+
+    def test_usb_close_waits_for_inflight_keyboard_start_then_unregisters(self):
+        client, keyboard, stream, handle = self.session_keyboard()
+        entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+        def hook(request, _data):
+            if request == 54:
+                entered.set()
+                if not release.wait(2):
+                    raise AssertionError('fixture register timeout')
+        handle.hook = hook
+        starter = threading.Thread(target=keyboard.start)
+        def close():
+            stream.close()
+            closed.set()
+        closer = threading.Thread(target=close)
+        starter.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            closer.start()
+            self.assertFalse(closed.wait(.03))
+            self.assertFalse(handle.closed)
+        finally:
+            release.set()
+            starter.join(2)
+            if closer.ident is not None:
+                closer.join(2)
+        self.assertFalse(starter.is_alive())
+        self.assertFalse(closer.is_alive())
+        self.assertTrue(handle.closed)
+        self.assertEqual(handle.calls[-1][0], 55)
+        self.assertEqual(keyboard.snapshot()['status'], 'closed')
+        self.assertEqual(keyboard.snapshot()['cleanup_errors'], [])
+
     def test_captured_aoa2_is_used_without_another_get_protocol(self):
         handle = FakeHandle()
         client = SimpleNamespace(backend='DIRECT_USB_AOA',
@@ -225,6 +309,22 @@ class KeyboardWorkerTests(unittest.TestCase):
         self.assertEqual([call[0] for call in handle.calls], [54, 55])
         self.assertFalse(handle.cancel.is_set())
         self.assertFalse(handle.closed)
+
+    def test_winusb_registration_uses_actual_native_uncertainty_without_replay(self):
+        from hu_lab.windows_winusb import WinUSBError
+        for issued in (False, True):
+            with self.subTest(issued=issued):
+                keyboard, handle = self.keyboard()
+                def hook(request, _data):
+                    if request == 54:
+                        raise WinUSBError('WinUSB control', 87, issued=issued)
+                handle.hook = hook
+                state = keyboard.start()
+                self.assertEqual(state['status'], 'failed')
+                self.assertIn('Win32 error 87', state['error'])
+                keyboard.close()
+                self.assertEqual([call[0] for call in handle.calls], [54, 55] if issued else [54])
+                self.assertFalse(handle.cancel.is_set())
 
     def test_failed_descriptor_unregisters_and_does_not_close_shared_handle(self):
         keyboard, handle = self.keyboard()

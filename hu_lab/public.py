@@ -5,8 +5,9 @@ import hashlib
 import json
 import time
 
-from .native_usb import NativeUSBTransportFactory
-from .usb import LibUSB, RecoveryBlocked, USBIdentity
+from .native_usb import ACCESSORY_IDS, NativeUSBTransportFactory
+from .usb import (LibUSB, RecoveryBlocked, USBEnumerationChanged, USBIdentity,
+                  acquisition_stage, open_for_acquisition)
 
 
 @dataclass(frozen=True)
@@ -36,19 +37,26 @@ def select_port(devices, physical_key):
 def prepare_usb(physical_key, output, *, aoa_start=False, usb_factory=LibUSB, expected_identity=None):
     """Read the selected serial, then create a factory; no AOA request/claim here."""
     output = Path(output)
-    with usb_factory() as usb:
-        selected = select_port(usb.discover(), physical_key)
-        identity = USBIdentity(**{**selected["identity"], "ports": tuple(selected["identity"]["ports"])})
-        if expected_identity is not None:
-            _require_selected_enumeration(identity, expected_identity)
-        with usb.open_exact(identity) as handle:
-            if expected_identity is not None:
-                opened = USBIdentity(**{**handle.descriptor["identity"],
-                                       "ports": tuple(handle.descriptor["identity"]["ports"])})
-                _require_selected_enumeration(opened, expected_identity)
-            serial_hash = handle.serial_sha256()
-            if expected_identity is not None and expected_identity.serial_sha256 and serial_hash != expected_identity.serial_sha256:
-                raise RecoveryBlocked("Selected USB device serial changed; refresh and select it again")
+    with acquisition_stage('preflight_discovery', expected_identity):
+        context = usb_factory()
+    with context as usb:
+        with acquisition_stage('preflight_discovery', expected_identity):
+            devices = usb.discover()
+        with acquisition_stage('preflight_selection', expected_identity):
+            selected = select_port(devices, physical_key)
+            identity = USBIdentity(**{**selected["identity"], "ports": tuple(selected["identity"]["ports"])})
+            picker = expected_identity or identity
+            _require_selected_enumeration(identity, picker)
+        stage = ("preflight_accessory_open" if (picker.vid, picker.pid) in ACCESSORY_IDS
+                 else "preflight_normal_open")
+        with open_for_acquisition(usb, identity, selected_identity=picker, stage=stage) as handle:
+            opened = USBIdentity(**{**handle.descriptor["identity"],
+                                   "ports": tuple(handle.descriptor["identity"]["ports"])})
+            with acquisition_stage(stage, picker, attempted_identity=opened):
+                _require_selected_enumeration(opened, picker)
+                serial_hash = handle.serial_sha256()
+                if picker.serial_sha256 and serial_hash != picker.serial_sha256:
+                    raise RecoveryBlocked("Selected USB device serial changed; refresh and select it again")
     identity = USBIdentity(**{**asdict(identity), "serial_sha256": serial_hash})
     output.mkdir(parents=True, exist_ok=True)
     path = output / "usb-selection.json"
@@ -69,4 +77,4 @@ def _require_selected_enumeration(actual, expected):
     """Reject a stale desktop picker selection before reading serial or AOA."""
     names = ("bus", "ports", "vid", "pid", "address")
     if any(getattr(actual, name) != getattr(expected, name) for name in names):
-        raise RecoveryBlocked("Selected USB device changed since discovery; refresh and select it again")
+        raise USBEnumerationChanged("Selected USB device changed since discovery; refresh and select it again", actual)
