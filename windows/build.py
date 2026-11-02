@@ -22,10 +22,11 @@ import urllib.request
 import zipfile
 
 PROJECT = Path(__file__).resolve().parents[1]
-VERSION = "0.3.2-rc.3"
+VERSION = "0.4.0"
 NAME = f"CarLife-HeadUnit-Emulator-{VERSION}-Windows-x64"
-RELEASE_CHANNEL = "diagnostic-test"
 _release, _, _rc = VERSION.partition("-rc.")
+RELEASE_CHANNEL = "diagnostic-test" if _rc else "stable"
+PE_FLAGS = 0x02 if _rc else 0  # VS_FF_PRERELEASE only for RCs.
 PE_VERSION = ",".join((*_release.split("."), _rc or "0"))
 # ctypes resolves these at runtime, so they are not covered by PE import tables.
 REQUIRED_USB_EXPORTS = tuple("libusb_" + name for name in (
@@ -173,9 +174,9 @@ def compile_launcher(stage, work):
     resource = work / "launcher.rc"
     resource.write_text('1 ICON "HeadUnit.ico"\n'
         f'1 VERSIONINFO\nFILEVERSION {PE_VERSION}\nPRODUCTVERSION {PE_VERSION}\n'
-        'FILEFLAGSMASK 0x3F\nFILEFLAGS 0x02\nFILEOS 0x40004\nFILETYPE 1\nBEGIN\n'
+        f'FILEFLAGSMASK 0x3F\nFILEFLAGS 0x{PE_FLAGS:02X}\nFILEOS 0x40004\nFILETYPE 1\nBEGIN\n'
         'BLOCK "StringFileInfo" BEGIN BLOCK "040904B0" BEGIN\n'
-        'VALUE "FileDescription", "CarLife HeadUnit Emulator (USB diagnostic test build)"\nVALUE "ProductName", "CarLife HeadUnit Emulator"\n'
+        'VALUE "FileDescription", "CarLife HeadUnit Emulator"\nVALUE "ProductName", "CarLife HeadUnit Emulator"\n'
         f'VALUE "FileVersion", "{VERSION}"\nVALUE "ProductVersion", "{VERSION}"\n'
         'VALUE "OriginalFilename", "CarLifeHeadUnitEmulator.exe"\nEND END\n'
         'BLOCK "VarFileInfo" BEGIN VALUE "Translation", 0x409, 1200 END\nEND\n')
@@ -205,7 +206,7 @@ def compile_driver_setup(stage, work, header_archive, header_record):
     (helper / "setup.rc").write_text(
         '1 24 "setup.manifest"\n'
         f'1 VERSIONINFO\nFILEVERSION {PE_VERSION}\nPRODUCTVERSION {PE_VERSION}\n'
-        'FILEFLAGSMASK 0x3F\nFILEFLAGS 0x02\nFILEOS 0x40004\nFILETYPE 1\nBEGIN\n'
+        f'FILEFLAGSMASK 0x3F\nFILEFLAGS 0x{PE_FLAGS:02X}\nFILEOS 0x40004\nFILETYPE 1\nBEGIN\n'
         'BLOCK "StringFileInfo" BEGIN BLOCK "040904B0" BEGIN\n'
         'VALUE "FileDescription", "CarLife HeadUnit Emulator - AOA MI_00 WinUSB setup"\n'
         'VALUE "ProductName", "CarLife HeadUnit Emulator"\n'

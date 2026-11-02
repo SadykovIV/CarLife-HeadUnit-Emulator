@@ -47,7 +47,7 @@ class WindowsDriverSetupWindowTests(unittest.TestCase):
         self.window.show()
         self.window.transport.setCurrentIndex(self.window.transport.findData('usb'))
         self.window.tabs.setCurrentIndex(next(i for i in range(self.window.tabs.count())
-            if self.window.tabs.tabText(i)=='Подключение'))
+            if self.window.tabs.tabText(i)=='Приборка и HUD'))
         self.wait_for(lambda:self.window.usb_devices.currentData() and self.idle())
         self.discovery.reset_mock()
 

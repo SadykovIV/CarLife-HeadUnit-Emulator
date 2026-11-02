@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.0](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/tag/v0.4.0) — 2026-11-03
+
+- Keep the phone projection visible while **«Приборка и HUD»** shows the turn arrow, distance and current track alongside it. The same panel offers a local instrument demo and access to Windows driver setup.
+- Use CarLife v2 · Honda for every desktop USB, TCP and demo connection. There is no protocol selector; older v1 preferences cannot switch a session back to v1.
+- On Windows, guide users through setup of the separate CarLife **MI_00** only when it is needed. A working installation and the separate ADB function are left alone.
+
 ## [0.3.2-rc.3](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/tag/v0.3.2-rc.3) — 2026-11-02 (prerelease)
 
 - Add an instrument cluster showing the next maneuver, distance, track and artist from CarLife subscriptions. A local driving demo exercises the same messages without a phone or car.

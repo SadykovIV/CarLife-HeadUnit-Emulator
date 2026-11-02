@@ -31,7 +31,10 @@ from .windows_driver_setup import inspect_setup, apply_setup
 from .frame_wake import FrameWake
 from .macos_activity import UserInitiatedActivity
 
-VERSION = "0.3.2-rc.3"
+VERSION = "0.4.0"
+
+
+DESKTOP_PROFILE = 'honda-v2'
 
 
 def _windows_driver_ui():
@@ -86,7 +89,7 @@ class _ConnectionAttemptFailed(Exception):
                 message += ' Проверьте драйвер этого интерфейса в диспетчере устройств Windows.'
         selection = (detail.get('windows_selection') or {}).get('target') or detail.get('selected_identity') or {}
         if issue in ('adb_only', 'no_winusb', 'no_verified_accessory') and selection.get('pid') == 0x2d01:
-            message += ' Откройте «Подключение» → «Настроить WinUSB…».'
+            message += ' Откройте «Приборка и HUD» → «Настроить WinUSB…».'
         super().__init__(message)
 
 
@@ -544,15 +547,12 @@ class HeadUnitWindow(QMainWindow):
         self.inspector.setMaximumWidth(420)
         self.splitter.addWidget(self.inspector)
         self.splitter.setSizes([1000, 340])
-        self.connection_tab()
+        self.hud_tab()
         self.display_tab()
         self.input_tab()
         self.audio_tab()
         self.body.addWidget(self.splitter)
 
-        self.cluster = ClusterPage(self.start_cluster_demo)
-        self.body.addWidget(self.cluster)
-        self.cluster_tab = self.tabs.addTab('Приборка')
         diagnostics = QWidget()
         details = QVBoxLayout(diagnostics)
         details.setContentsMargins(24, 12, 24, 20)
@@ -630,14 +630,12 @@ class HeadUnitWindow(QMainWindow):
     def tab_changed(self, index):
         self.cancel_typing()
         self.video.cancel('tab_changed')
-        if index == self.cluster_tab:
-            self.body.setCurrentWidget(self.cluster)
-            self.refresh_cluster()
-        else:
-            self.body.setCurrentWidget(self.diagnostics if index == self.tabs.count() - 1 else self.splitter)
+        self.body.setCurrentWidget(self.diagnostics if index == self.tabs.count() - 1 else self.splitter)
         self.inspector.setVisible(1 <= index <= self.inspector.count())
         if 1 <= index <= self.inspector.count():
             self.inspector.setCurrentIndex(index - 1)
+        if index == self.hud_tab_index:
+            self.refresh_cluster()
 
     def start_cluster_demo(self):
         if self.closing or self.busy or self.client:
@@ -662,16 +660,11 @@ class HeadUnitWindow(QMainWindow):
         self.tabs.addTab(title)
         return layout
 
-    def connection_tab(self):
-        layout = self.tab('Подключение')
-        layout.addWidget(label('Параметры сессии', 'brand'))
-        self.profile = QComboBox()
-        self.profile.addItem('CarLife v1', 'v1')
-        self.profile.addItem('CarLife v2 · Honda', 'honda-v2')
-        self.profile.setCurrentIndex(1)
-        layout.addWidget(label('Профиль протокола', 'muted'))
-        layout.addWidget(self.profile)
-        layout.addWidget(label('Устройство выбирается сверху. Режим USB AOA включается при подключении автоматически.', 'muted', True))
+    def hud_tab(self):
+        layout = self.tab('Приборка и HUD')
+        self.hud_tab_index = self.tabs.count() - 1
+        self.cluster = ClusterPage(self.start_cluster_demo)
+        layout.addWidget(self.cluster)
         self.driver_group = QGroupBox('Драйвер Windows')
         driver_box = QVBoxLayout(self.driver_group)
         self.driver_status = label('Если Windows видит только ADB, проверьте настройку интерфейса CarLife.', 'muted', True)
@@ -690,7 +683,6 @@ class HeadUnitWindow(QMainWindow):
         self.reconnect_button = button('Переподключить', self.reconnect_session)
         layout.addWidget(self.reconnect_button)
         layout.addStretch()
-        layout.addWidget(label('Профиль применяется при следующем подключении. OEM-аутентификация и Bluetooth HFP не реализованы.', 'muted', True))
 
     def display_tab(self):
         layout = self.tab('Видео')
@@ -1054,7 +1046,7 @@ class HeadUnitWindow(QMainWindow):
         if self.width.value() % 2 or self.height.value() % 2:
             raise ValueError('Для H.264 выберите чётные ширину и высоту.')
         return DesktopConfig(transport='tcp' if kind == 'demo' else kind,
-            profile=self.profile.currentData(), host=self.host.text().strip(), port=self.port.value(),
+            profile=DESKTOP_PROFILE, host=self.host.text().strip(), port=self.port.value(),
             usb_identity=USBIdentity(**{**ident,'ports':tuple(ident['ports'])}) if kind == 'usb' else None,
             width=self.width.value(),height=self.height.value(),fps=self.fps.value(),
             touch_profile=self.touch_profile.currentData(),audio_capture=self.capture.isChecked(),
@@ -1098,7 +1090,7 @@ class HeadUnitWindow(QMainWindow):
         attempt = dict(application='CarLife HeadUnit Emulator', version=VERSION, platform=sys.platform,
                        architecture=platform.machine(), attempt_id=output.name, session_id=None,
                        state='CONNECTING', started_at=started_at.isoformat(), error=None, demo=demo_mode,
-                       transport=kind, profile=self.profile.currentData(),
+                       transport=kind, profile=DESKTOP_PROFILE,
                        backend='DIRECT_USB_AOA' if kind == 'usb' else 'TCP_STREAM',
                        selected_identity=selected, decoded_frames=0)
         self.last_report = attempt
@@ -1379,7 +1371,7 @@ class HeadUnitWindow(QMainWindow):
         self.scan_button.setEnabled(not connected and not self.busy)
         if hasattr(self, 'driver_button'):
             self.driver_button.setEnabled(not connected and not self.busy and not self.closing)
-        for widget in (self.transport, self.usb_devices, self.host, self.port, self.profile, self.touch_profile, self.hid_enabled):
+        for widget in (self.transport, self.usb_devices, self.host, self.port, self.touch_profile, self.hid_enabled):
             widget.setEnabled(not connected and not self.busy)
         self.reset_button.setEnabled(bool(streaming))
         self.pause_button.setEnabled(bool(connected and not self.busy and self.client.session.state in ('STREAMING','PAUSED')))
@@ -1456,7 +1448,7 @@ class HeadUnitWindow(QMainWindow):
                 self.gesture_due = time.monotonic()+.04
         if time.monotonic() - self.metrics_time > .5:
             self.metrics_time = time.monotonic()
-            if self.tabs.currentIndex() == self.cluster_tab:
+            if self.tabs.currentIndex() == self.hud_tab_index:
                 self.refresh_cluster()
             self.update_keyboard_status()
             audio = self.audio.snapshot()
@@ -1482,7 +1474,7 @@ class HeadUnitWindow(QMainWindow):
     def load_settings(self):
         try: saved = json.loads((self.data_dir/'settings.json').read_text(encoding='utf-8'))
         except (OSError,ValueError): return
-        for name in ('transport','profile','touch_profile','fit','rotation','theme','keyboard_layout'):
+        for name in ('transport','touch_profile','fit','rotation','theme','keyboard_layout'):
             widget = getattr(self,name)
             for n in range(widget.count()):
                 if widget.itemData(n) == saved.get(name): widget.setCurrentIndex(n)
@@ -1497,7 +1489,8 @@ class HeadUnitWindow(QMainWindow):
             self.touch_profile.setCurrentIndex(self.touch_profile.findData('legacy-dual'))
 
     def save_settings(self):
-        saved = {name:getattr(self,name).currentData() for name in ('transport','profile','touch_profile','fit','rotation','theme','keyboard_layout')}
+        saved = {name:getattr(self,name).currentData() for name in ('transport','touch_profile','fit','rotation','theme','keyboard_layout')}
+        saved['profile'] = DESKTOP_PROFILE
         saved.update({name:getattr(self,name).value() for name in ('width','height','fps','port','volume')})
         saved.update(host=self.host.text(),muted=self.muted.isChecked(),fallback=self.fallback.isChecked(), settings_version=2, hid_enabled=self.hid_enabled.isChecked())
         temporary = self.data_dir/'settings.json.tmp'
@@ -1537,7 +1530,8 @@ def main(argv=None):
     parser.add_argument('--demo',action='store_true')
     parser.add_argument('--usb',metavar='PHYSICAL_KEY',help='connect only this explicitly selected USB port')
     parser.add_argument('--aoa-start',action='store_true',help='compatibility option; AOA is always enabled for the selected --usb device')
-    parser.add_argument('--profile',choices=('v1','honda-v2'))
+    parser.add_argument('--profile',choices=(DESKTOP_PROFILE,),
+                        help='compatibility option; desktop sessions always use Honda v2')
     parser.add_argument('--width',type=int)
     parser.add_argument('--height',type=int)
     parser.add_argument('--fps',type=int)
@@ -1558,8 +1552,6 @@ def main(argv=None):
             if not widget.minimum() <= value <= widget.maximum():
                 parser.error(f'--{name} outside {widget.minimum()}..{widget.maximum()}')
             widget.setValue(value)
-    if arguments.profile:
-        window.profile.setCurrentIndex(window.profile.findData(arguments.profile))
     window.show()
     if arguments.demo or arguments.usb:
         window.transport.setCurrentIndex(2 if arguments.demo else 0)

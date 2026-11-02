@@ -77,9 +77,9 @@ app = BUNDLE(
     bundle_identifier="org.carlife.headunit.lab",
     info_plist={
         "CFBundleDisplayName": "CarLife HeadUnit Emulator",
-        "CFBundleShortVersionString": "0.3.2",
-        "CFBundleVersion": "5",
-        "CarLifeVersion": "0.3.2-rc.3",
+        "CFBundleShortVersionString": "0.4.0",
+        "CFBundleVersion": "6",
+        "CarLifeVersion": "0.4.0",
         "LSMinimumSystemVersion": minimum_macos,
         "LSApplicationCategoryType": "public.app-category.developer-tools",
         "NSHighResolutionCapable": True,

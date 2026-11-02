@@ -1,9 +1,10 @@
 """CarLife instrument display. Only the active session supplies the values."""
+from html import escape
 import struct
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton,
+from PySide6.QtGui import QImage, QPainter, QPixmap
+from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton,
                                QSizePolicy, QVBoxLayout, QWidget)
 
 
@@ -40,15 +41,35 @@ def turn_pixmap(blob):
     image = QImage.fromData(blob, 'PNG')
     if image.isNull():
         return None
-    return QPixmap.fromImage(image).scaled(100, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    return QPixmap.fromImage(image).scaled(44, 44, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
 
-def text_label(text, style, *, wrap=False):
-    widget = QLabel(text)
+class _ElidedLabel(QLabel):
+    """Keep the original plain text for accessibility, and fit it to one line."""
+    def setText(self, text):
+        super().setText(text)
+        # Qt tooltips can interpret markup. A road or track name is plain data.
+        self.setToolTip(f'<qt>{escape(text)}</qt>' if text else '')
+
+    def paintEvent(self, event):
+        rect = self.contentsRect()
+        text = self.text()
+        short = self.fontMetrics().elidedText(text, Qt.ElideRight, max(0, rect.width()))
+        if short == text:
+            super().paintEvent(event)
+            return
+        with QPainter(self) as painter:
+            self.style().drawItemText(painter, rect, self.alignment(), self.palette(), self.isEnabled(),
+                                      short, self.foregroundRole())
+
+
+def text_label(text, style, *, wrap=False, elide=False):
+    widget = _ElidedLabel() if elide else QLabel()
     widget.setTextFormat(Qt.PlainText)
+    widget.setText(text)
     widget.setObjectName(style)
     widget.setWordWrap(wrap)
-    if wrap:
+    if wrap or elide:
         widget.setMinimumWidth(0)
         widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
     return widget
@@ -58,8 +79,8 @@ def card(title):
     frame = QFrame()
     frame.setObjectName('clusterCard')
     layout = QVBoxLayout(frame)
-    layout.setContentsMargins(28, 24, 28, 24)
-    layout.setSpacing(12)
+    layout.setContentsMargins(14, 12, 14, 12)
+    layout.setSpacing(6)
     layout.addWidget(text_label(title, 'clusterKicker'))
     return frame, layout
 
@@ -67,61 +88,71 @@ def card(title):
 def waiting_text(subscription, *, music):
     state = subscription.get('state')
     if state == 'unsupported':
-        return 'Телефон не поддерживает подписку на музыку.' if music else 'Телефон не поддерживает подписку на навигацию.'
+        return 'Подписка не поддерживается'
     if state == 'active':
-        return 'Ожидание данных о песне' if music else 'Ожидание следующего манёвра'
+        return 'Ожидание трека' if music else 'Ожидание манёвра'
     if state == 'requested':
-        return 'Ожидание ответа телефона на подписку'
+        return 'Ожидание ответа телефона'
+    if state == 'stopped':
+        return 'Подписка завершена'
     return 'Нет данных'
 
 
 class ClusterPage(QWidget):
     def __init__(self, start_demo):
         super().__init__()
+        # The inspector owns the outer margins and scroll area. These cards
+        # should occupy only their natural height above the other HUD settings.
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(32, 20, 32, 24)
-        layout.setSpacing(16)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(9)
         heading = QHBoxLayout()
-        heading.addWidget(text_label('Приборка', 'clusterHeading'))
-        heading.addStretch()
-        self.source = text_label('Отключено', 'badge')
-        heading.addWidget(self.source)
+        heading.setSpacing(6)
+        heading.addWidget(text_label('Подсказки приборки', 'clusterHeading', wrap=True), 1)
+        self.source = text_label('Отключено', 'clusterSource')
+        heading.addWidget(self.source, 0, Qt.AlignVCenter)
         layout.addLayout(heading)
         self.hint = text_label('', 'muted', wrap=True)
         layout.addWidget(self.hint)
 
-        grid = QGridLayout()
-        grid.setSpacing(16)
         nav, box = card('СЛЕДУЮЩИЙ МАНЁВР')
+        row = QHBoxLayout()
+        row.setSpacing(10)
         self.arrow = text_label('—', 'clusterArrow')
         self.arrow.setAlignment(Qt.AlignCenter)
-        self.arrow.setFixedSize(116, 116)
+        self.arrow.setFixedSize(54, 54)
         self.arrow.setAccessibleName('Стрелка манёвра')
-        box.addWidget(self.arrow)
-        self.distance = text_label('—', 'clusterValue')
-        box.addWidget(self.distance)
+        row.addWidget(self.arrow, 0, Qt.AlignVCenter)
+        values = QVBoxLayout()
+        values.setSpacing(1)
+        self.distance = text_label('—', 'clusterValue', elide=True)
+        self.distance.setAccessibleName('Расстояние до манёвра')
+        values.addWidget(self.distance)
         self.maneuver = text_label('', 'clusterTitle', wrap=True)
-        box.addWidget(self.maneuver)
-        self.road = text_label('', 'clusterSecondary', wrap=True)
+        values.addWidget(self.maneuver)
+        row.addLayout(values, 1)
+        box.addLayout(row)
+        self.road = text_label('', 'clusterSecondary', elide=True)
+        self.road.setAccessibleName('Дорога')
         box.addWidget(self.road)
-        box.addStretch()
-        grid.addWidget(nav, 0, 0)
+        layout.addWidget(nav)
+
         music, box = card('СЕЙЧАС ИГРАЕТ')
-        box.addStretch()
-        self.song = text_label('—', 'clusterTitle', wrap=True)
+        self.song = text_label('—', 'clusterTitle', elide=True)
+        self.song.setAccessibleName('Композиция')
         box.addWidget(self.song)
-        self.artist = text_label('', 'clusterSecondary', wrap=True)
+        self.artist = text_label('', 'clusterSecondary', elide=True)
+        self.artist.setAccessibleName('Исполнитель')
         box.addWidget(self.artist)
-        self.album = text_label('', 'muted', wrap=True)
+        self.album = text_label('', 'muted', elide=True)
+        self.album.setAccessibleName('Альбом')
         box.addWidget(self.album)
-        box.addStretch()
-        grid.addWidget(music, 0, 1)
-        grid.setColumnStretch(0, 3)
-        grid.setColumnStretch(1, 2)
-        layout.addLayout(grid, 1)
+        layout.addWidget(music)
+
         self.demo_button = QPushButton('Запустить демо приборки')
         self.demo_button.clicked.connect(start_demo)
-        layout.addWidget(self.demo_button, 0, Qt.AlignLeft)
+        layout.addWidget(self.demo_button)
         self._rendered = None
         self._icon = None
         self.refresh(None, demo=False)
@@ -132,10 +163,11 @@ class ClusterPage(QWidget):
         if key == self._rendered:
             return
         self._rendered = key
-        self.source.setText('  Демо  ' if demo else ('  CarLife  ' if cluster is not None else '  Отключено  '))
-        self.hint.setText('Демонстрационный маршрут и музыка поступают от локального эмулятора телефона.'
-                          if demo else ('Данные поступают от телефона по подписке CarLife.' if cluster is not None
-                          else 'Подключите телефон или запустите демо, чтобы увидеть манёвры и музыку.'))
+        self.source.setText('Демо' if demo else ('CarLife' if cluster is not None else 'Отключено'))
+        hint = ('Демонстрационный маршрут и музыка.' if demo else
+                ('Подключите телефон или запустите демо.' if cluster is None else ''))
+        self.hint.setText(hint)
+        self.hint.setVisible(bool(hint))
         self.demo_button.setVisible(cluster is None)
         subscriptions = snapshot.get('subscriptions', {})
         nav = snapshot.get('navigation') or {}
@@ -144,7 +176,10 @@ class ClusterPage(QWidget):
         glyph, name = TURNS.get(turn, ('?', f'Манёвр {turn}'))
         self.maneuver.setText(name if nav else waiting_text(subscriptions.get('navigation', {}), music=False))
         self.distance.setText(distance_text(nav.get('distance_m')))
+        self.arrow.setVisible(bool(nav))
+        self.distance.setVisible(bool(nav) and nav.get('distance_m') is not None)
         self.road.setText(nav.get('road') or '')
+        self.road.setVisible(bool(self.road.text()))
         icon_key = (turn, nav.get('icon'))
         if icon_key != self._icon:
             self._icon = icon_key
@@ -157,3 +192,5 @@ class ClusterPage(QWidget):
                                                  if not music else 'Без названия'))
         self.artist.setText(music.get('artist') or '')
         self.album.setText(music.get('album') or '')
+        self.artist.setVisible(bool(self.artist.text()))
+        self.album.setVisible(bool(self.album.text()))

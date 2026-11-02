@@ -26,7 +26,7 @@ try:
 except ImportError:
     desktop = None
 
-from hu_lab.protocol import VIDEO_RESET, VIDEO_PAUSE, VIDEO_START, HARD_KEY, fields
+from hu_lab.protocol import VIDEO_RESET, VIDEO_PAUSE, VIDEO_START, HARD_KEY, HU_VERSION, fields
 from hu_lab.touch import ACTION3
 from hu_lab.macos_activity import UserInitiatedActivity
 
@@ -72,7 +72,6 @@ class DesktopWindowTests(unittest.TestCase):
         self.window = desktop.HeadUnitWindow(Path(self.tmp.name))
         self.window.muted.setChecked(True)
         self.window.transport.setCurrentIndex(self.window.transport.findData("demo"))
-        self.window.profile.setCurrentIndex(self.window.profile.findData("honda-v2"))
         self.window.touch_profile.setCurrentIndex(self.window.touch_profile.findData("action3-multi"))
         self.window.width.setValue(320)
         self.window.height.setValue(240)
@@ -432,13 +431,16 @@ class DesktopWindowTests(unittest.TestCase):
         window = self.window
         self.assertTrue(window.video.isVisible())
         self.assertFalse(window.inspector.isVisible())
-        for title, control in (("Подключение", window.profile), ("Видео", window.width),
+        self.assertEqual([window.tabs.tabText(i) for i in range(window.tabs.count())],
+                         ["Экран", "Приборка и HUD", "Видео", "Ввод", "Звук", "Диагностика"])
+        for title, control in (("Приборка и HUD", window.cluster), ("Видео", window.width),
                                ("Звук", window.volume)):
             self.select_tab(title)
             self.assertTrue(window.header.isVisible())
             self.assertTrue(window.video.isVisible())
             self.assertTrue(window.inspector.isVisible())
             self.assertTrue(control.isVisible())
+            self.assertEqual(window.cluster.isVisible(), title == "Приборка и HUD")
             self.assertFalse(window.log.isVisible())
         self.select_tab("Диагностика")
         self.assertTrue(window.header.isVisible())
@@ -452,12 +454,13 @@ class DesktopWindowTests(unittest.TestCase):
 
     def test_cluster_demo_uses_wire_and_clears_on_disconnect(self):
         window = self.window
-        self.select_tab("Приборка")
+        self.select_tab("Приборка и HUD")
         self.assertTrue(window.cluster.isVisible())
-        self.assertFalse(window.video.isVisible())
+        self.assertTrue(window.video.isVisible())
+        self.assertTrue(window.inspector.isAncestorOf(window.cluster))
         self.assertEqual(window.cluster.distance.text(), "—")
         QTest.mouseClick(window.cluster.demo_button, Qt.LeftButton)
-        self.wait_for(lambda: window.cluster.song.text() == "Ночной рейс" and
+        self.wait_for(lambda: window.video.image is not None and window.cluster.song.text() == "Ночной рейс" and
                       window.cluster.road.text() == "Набережная")
         self.assertEqual(window.cluster.maneuver.text(), "Направо")
         self.assertIn("м", window.cluster.distance.text())
@@ -474,7 +477,6 @@ class DesktopWindowTests(unittest.TestCase):
         window.transport.setCurrentIndex(window.transport.findData("tcp"))
         window.host.setText("127.0.0.2")
         window.port.setValue(8123)
-        window.profile.setCurrentIndex(window.profile.findData("v1"))
         window.touch_profile.setCurrentIndex(window.touch_profile.findData("legacy-dual"))
         window.width.setValue(640); window.height.setValue(360); window.fps.setValue(24)
         window.fit.setCurrentIndex(window.fit.findData("crop"))
@@ -488,7 +490,9 @@ class DesktopWindowTests(unittest.TestCase):
         saved_path = Path(self.tmp.name) / "settings.json"
         saved = json.loads(saved_path.read_text())
         self.assertNotIn("aoa_start", saved)
-        # A legacy preference must never turn off automatic desktop AOA.
+        self.assertEqual(saved["profile"], "honda-v2")
+        # A prior release could save both of these legacy choices.
+        saved["profile"] = "v1"
         saved["aoa_start"] = False
         saved_path.write_text(json.dumps(saved))
         self.window = window = desktop.HeadUnitWindow(Path(self.tmp.name))
@@ -498,7 +502,7 @@ class DesktopWindowTests(unittest.TestCase):
         self.assertEqual((config.transport, config.host, config.port), ("tcp", "127.0.0.2", 8123))
         self.assertFalse(config.aoa_start)
         self.assertEqual((config.width, config.height, config.fps), (640, 360, 24))
-        self.assertEqual((config.profile, config.touch_profile), ("v1", "legacy-dual"))
+        self.assertEqual((config.profile, config.touch_profile), ("honda-v2", "legacy-dual"))
         self.assertFalse(config.allow_mode_fallback)
         self.assertTrue(window.tcp_group.isVisible())
         self.assertFalse(window.usb_group.isVisible())
@@ -516,6 +520,12 @@ class DesktopWindowTests(unittest.TestCase):
         window.usb_devices.addItem("Selected phone", dict(
             bus=1, ports=[2, 3], vid=0x1234, pid=0x5678, address=4))
         self.assertTrue(window.configuration().aoa_start)
+        self.assertEqual(window.configuration().profile, "honda-v2")
+        window.transport.setCurrentIndex(window.transport.findData("demo"))
+        window.muted.setChecked(True)
+        _, peer = self.start_demo()
+        self.assertEqual([fields(p)[1] for msg,p in peer.commands if msg==HU_VERSION], [2])
+        self.assertEqual(json.loads(saved_path.read_text())["profile"], "honda-v2")
 
     def test_decoder_wakes_display_without_periodic_timer_and_disconnect_releases_activity(self):
         window = self.window
@@ -528,7 +538,7 @@ class DesktopWindowTests(unittest.TestCase):
             self.assertGreater(window.frame_wake.snapshot()["consumed"], 0)
         finally:
             window.timer.start(33)
-        for control in (window.transport, window.usb_devices, window.host, window.port, window.profile):
+        for control in (window.transport, window.usb_devices, window.host, window.port):
             self.assertFalse(control.isEnabled())
         QTest.mouseClick(window.disconnect_button, Qt.LeftButton)
         self.wait_for(lambda: window.client is None and not window.busy)
