@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/tag/v0.4.1) — 2026-11-06
+
+- Fix USB connection to Wizcar A2, which could enter accessory mode but fail protocol negotiation. Send the 8-byte channel header and message body in separate USB transfers, matching Baidu HU framing, while preserving the write deadline and protection against replay after a failed write.
+- Verify connection and 1280×720 video at approximately 30 fps on a physical Wizcar A2 connected to macOS. Windows uses the same transport fix; physical Windows USB operation was not validated.
+- **Known limitation:** reconnecting Wizcar A2 after ending a session still requires unplugging and reconnecting the adapter, then refreshing the USB list. Reconnection without a physical unplug is not fixed in this release.
+
+See the [release manifest](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/download/v0.4.1/RELEASE.json) for the validation record.
+
 ## [0.4.0](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/tag/v0.4.0) — 2026-11-03
 
 - Keep the phone projection visible while **«Приборка и HUD»** shows the turn arrow, distance and current track alongside it. The same panel offers a local instrument demo and access to Windows driver setup.

@@ -31,7 +31,7 @@ from .windows_driver_setup import inspect_setup, apply_setup
 from .frame_wake import FrameWake
 from .macos_activity import UserInitiatedActivity
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 
 DESKTOP_PROFILE = 'honda-v2'

@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import struct
 import threading
 import time
 
@@ -83,7 +84,7 @@ class ScopedUSBAdmission:
 
 
 class USBStream:
-    """Socket-like bounded byte stream; there is no socket or proxy underneath."""
+    """Stream reads and complete CarLife packet writes over the accessory pair."""
     def __init__(self, usb, handle, owner_lock, evidence, observer=None):
         self.usb, self.handle, self.owner_lock = usb, handle, owner_lock
         self.evidence = evidence
@@ -129,20 +130,45 @@ class USBStream:
                 raise OSError("USB stream closed or failed; write replay prohibited")
             if not data:
                 return
+            # HUClient sends exactly one Packet.encode() result per call.
+            # Reject fragments/coalesced packets before any USB transfer.
+            if len(data) < 8:
+                raise ValueError("USB sendall requires one complete CarLife packet")
+            channel, inner_size = struct.unpack_from(">II", data)
+            minimum = 8 if channel in (1, 6) else 12
+            if (channel not in range(1, 7) or not minimum <= inner_size <= 4 * 1024 * 1024
+                    or len(data) != inner_size + 8):
+                raise ValueError("USB sendall requires one complete CarLife packet")
             first = not self.first_write_complete
             # The gadget can enumerate before the MD queues its first read.
             # Keep two seconds for VERSION_MATCH inside the existing absolute
             # eight-second WAIT_VERSION bound; later commands retain two seconds.
             budget = 6 if first else 2
+            deadline = time.monotonic() + budget
             started = time.monotonic_ns()
             if first and self.observer:
                 self.observer("usb_first_write_begin", bytes=len(data), deadline_seconds=budget,
                               payload_sha256=hashlib.sha256(data).hexdigest(),
+                              framing="separate_outer_header_and_body", header_bytes=8,
                               wait_version_deadline_seconds=8, subsequent_write_seconds=2)
             try:
-                written = self.handle.write(data, budget)
-                if written != len(data):
-                    raise OSError(f"short USB stream write {written}/{len(data)}")
+                # Baidu HU AOAHostSetup.bulkTransferOut(head, ..., msg, ...)
+                # writes the outer header separately from the inner message.
+                # Source: milesking/apollo-DuerOS, CarLife-Android-Vehicle/src/
+                # com/baidu/carlifevehicle/connect/AOAHostSetup.java:413-423.
+                # Preserve this boundary for accessory readers doing read(8)
+                # then read(body_length); a combined transfer can lose its tail.
+                # The handle chunks the body at 16 KiB. Both parts share this
+                # lock and one deadline, including any partial-write retries.
+                written = 0
+                for part in (data[:8], data[8:]):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(f"USB write deadline after {written}/{len(data)} bytes")
+                    count = self.handle.write(part, remaining)
+                    written += count
+                    if count != len(part):
+                        raise OSError(f"short USB stream write {written}/{len(data)}")
             except Exception as error:
                 # A timeout may have sent a prefix. Never retry this logical
                 # write or grant another startup window on this stream.

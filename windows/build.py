@@ -22,7 +22,7 @@ import urllib.request
 import zipfile
 
 PROJECT = Path(__file__).resolve().parents[1]
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 NAME = f"CarLife-HeadUnit-Emulator-{VERSION}-Windows-x64"
 _release, _, _rc = VERSION.partition("-rc.")
 RELEASE_CHANNEL = "diagnostic-test" if _rc else "stable"

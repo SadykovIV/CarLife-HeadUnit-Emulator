@@ -129,14 +129,20 @@ class NativeUSBTests(unittest.TestCase):
             return (-7 if count < len(part) else 0), count
         stream, clock, calls, budgets, events = self.simulated_writer(transfer)
         wire = Packet(CMD, HU_VERSION, protobuf(f1=1, f2=0)).encode()
+        following = Packet(CMD, VIDEO_START).encode()
         self.assertEqual(len(wire), 20)
         with patch("hu_lab.usb.time.monotonic", side_effect=lambda: clock[0]):
             stream.sendall(wire)
-            stream.sendall(b"next-command")
+            stream.sendall(following)
         self.assertGreater(clock[0] - 100, 2)
-        self.assertEqual(bytes(delivered), wire + b"next-command")
-        self.assertEqual(budgets, [6, 2])
-        self.assertIn(wire[5:], [part for part, _ in calls])
+        self.assertEqual(bytes(delivered), wire + following)
+        self.assertEqual(len(budgets), 4)
+        self.assertEqual(budgets[0], 6)
+        self.assertLess(budgets[1], 3.6)  # Header wait consumes the body's budget.
+        self.assertEqual(budgets[2], 2)
+        self.assertLess(budgets[3], 2)
+        self.assertIn(wire[5:8], [part for part, _ in calls])
+        self.assertIn(wire[8:], [part for part, _ in calls])
         self.assertEqual(stream.tx_bytes, len(delivered))
         self.assertEqual([e["stage"] for e in events], ["usb_first_write_begin", "usb_first_write_complete"])
         self.assertEqual(events[0]["payload_sha256"], hashlib.sha256(wire).hexdigest())
@@ -146,14 +152,15 @@ class NativeUSBTests(unittest.TestCase):
             clock[0] += timeout_ms / 1000
             return -7, 0
         stream, clock, calls, budgets, events = self.simulated_writer(transfer)
+        wire = Packet(CMD, HU_VERSION, protobuf(f1=2, f2=0)).encode()
         with patch("hu_lab.usb.time.monotonic", side_effect=lambda: clock[0]):
-            with self.assertRaisesRegex(TimeoutError, "0/20 bytes"):
-                stream.sendall(b"x" * 20)
+            with self.assertRaisesRegex(TimeoutError, "0/8 bytes"):
+                stream.sendall(wire)
         self.assertGreaterEqual(clock[0] - 100, 6)
         self.assertLess(clock[0] - 100, 6.002)
         count = len(calls)
         with self.assertRaisesRegex(OSError, "replay prohibited"):
-            stream.sendall(b"x" * 20)
+            stream.sendall(wire)
         self.assertEqual(len(calls), count)
         self.assertEqual(budgets, [6])
         self.assertTrue(stream.handle.cancel.is_set())
@@ -161,30 +168,118 @@ class NativeUSBTests(unittest.TestCase):
         self.assertEqual(events[-1]["stage"], "usb_first_write_failed")
         self.assertFalse(events[-1]["replay"])
 
-    def test_after_first_success_normal_write_still_expires_in_two_seconds(self):
+    def test_version_reaches_reader_that_discards_a_transfer_tail_after_header(self):
+        # Model read(8), then read(inner_length) on an accessory implementation
+        # that drops bytes beyond the requested count in the first transfer.
+        # A single 20-byte write is acknowledged by USB but never yields VERSION.
+        received = bytearray()
+        awaiting_header = [True]
+        remaining = [0]
         def transfer(part, timeout_ms, clock, cancel):
-            if part == b"version":
+            if awaiting_header[0]:
+                received.extend(part[:8])
+                remaining[0] = int.from_bytes(part[4:8], 'big')
+                awaiting_header[0] = False
+            else:
+                count = min(len(part), remaining[0])
+                received.extend(part[:count])
+                remaining[0] -= count
+            return 0, len(part)
+        stream, clock, calls, budgets, events = self.simulated_writer(transfer)
+        wire = Packet(CMD, HU_VERSION, protobuf(f1=2, f2=0)).encode()
+        with patch("hu_lab.usb.time.monotonic", side_effect=lambda: clock[0]):
+            stream.sendall(wire)
+        self.assertEqual(remaining[0], 0)
+        packet, = FrameParser().feed(received)
+        self.assertEqual((packet.message, fields(packet.payload)), (HU_VERSION, {1: 2, 2: 0}))
+        self.assertEqual([part for part, _ in calls], [wire[:8], wire[8:]])
+        self.assertEqual(stream.tx_bytes, len(wire))
+
+    def test_partial_body_timeout_shares_header_deadline_and_never_replays(self):
+        header_done = [False]
+        body_started = [False]
+        def transfer(part, timeout_ms, clock, cancel):
+            if not header_done[0]:
+                clock[0] += 2.5
+                header_done[0] = True
+                return 0, len(part)
+            clock[0] += timeout_ms / 1000
+            if not body_started[0]:
+                body_started[0] = True
+                return -7, 3
+            return -7, 0
+        stream, clock, calls, budgets, events = self.simulated_writer(transfer)
+        wire = Packet(CMD, HU_VERSION, protobuf(f1=2, f2=0)).encode()
+        with patch("hu_lab.usb.time.monotonic", side_effect=lambda: clock[0]):
+            with self.assertRaisesRegex(TimeoutError, "3/12 bytes"):
+                stream.sendall(wire)
+        self.assertEqual(budgets, [6, 3.5])
+        self.assertGreaterEqual(clock[0] - 100, 6)
+        self.assertLess(clock[0] - 100, 6.002)
+        self.assertEqual(calls[0][0], wire[:8])
+        self.assertEqual(calls[1][0], wire[8:])
+        self.assertTrue(all(part == wire[11:] for part, _ in calls[2:]))
+        call_count = len(calls)
+        with self.assertRaisesRegex(OSError, "replay prohibited"):
+            stream.sendall(wire)
+        self.assertEqual(len(calls), call_count)
+        self.assertTrue(stream.handle.cancel.is_set())
+        self.assertFalse(stream.first_write_complete)
+        self.assertEqual(stream.tx_bytes, 0)
+
+    def test_large_packet_keeps_header_separate_and_body_chunks_bounded(self):
+        stream, clock, calls, budgets, events = self.simulated_writer(
+            lambda part, timeout_ms, clock, cancel: (0, len(part)))
+        wire = Packet(MEDIA, MEDIA_DATA, b'x' * 40000).encode()
+        with patch("hu_lab.usb.time.monotonic", side_effect=lambda: clock[0]):
+            stream.sendall(wire)
+        self.assertEqual([len(part) for part, _ in calls], [8, 16384, 16384, 7244])
+        self.assertEqual(b''.join(part for part, _ in calls), wire)
+
+    def test_incomplete_or_coalesced_packets_are_rejected_before_usb(self):
+        stream, clock, calls, budgets, events = self.simulated_writer(
+            lambda part, timeout_ms, clock, cancel: (0, len(part)))
+        wire = Packet(CMD, HU_VERSION, protobuf(f1=2, f2=0)).encode()
+        for malformed in (wire[:7], wire[:8], wire[:-1], wire + wire,
+                          b'\0\0\0\7' + wire[4:]):
+            with self.subTest(length=len(malformed)), self.assertRaisesRegex(
+                    ValueError, "one complete CarLife packet"):
+                stream.sendall(malformed)
+        self.assertEqual(calls, [])
+        self.assertFalse(stream.write_failed)
+        self.assertFalse(stream.first_write_complete)
+        with patch("hu_lab.usb.time.monotonic", side_effect=lambda: clock[0]):
+            stream.sendall(wire)
+        self.assertEqual(stream.tx_bytes, len(wire))
+
+    def test_after_first_success_normal_write_still_expires_in_two_seconds(self):
+        wire = Packet(CMD, HU_VERSION, protobuf(f1=2, f2=0)).encode()
+        delivered = bytearray()
+        def transfer(part, timeout_ms, clock, cancel):
+            if len(delivered) < len(wire):
+                delivered.extend(part)
                 return 0, len(part)
             clock[0] += timeout_ms / 1000
             return -7, 0
         stream, clock, calls, budgets, events = self.simulated_writer(transfer)
         with patch("hu_lab.usb.time.monotonic", side_effect=lambda: clock[0]):
-            stream.sendall(b"version")
+            stream.sendall(wire)
             with self.assertRaises(TimeoutError):
-                stream.sendall(b"later")
-        self.assertEqual(budgets, [6, 2])
+                stream.sendall(Packet(CMD, VIDEO_START).encode())
+        self.assertEqual(budgets, [6, 6, 2])
         self.assertLess(clock[0] - 100, 2.002)
-        self.assertEqual(stream.tx_bytes, 7)
+        self.assertEqual(stream.tx_bytes, len(wire))
 
     def test_fatal_partial_first_write_is_not_replayed(self):
         def transfer(part, timeout_ms, clock, cancel):
             return -4, 3
         stream, clock, calls, budgets, events = self.simulated_writer(transfer)
+        wire = Packet(CMD, HU_VERSION, protobuf(f1=2, f2=0)).encode()
         with patch("hu_lab.usb.time.monotonic", side_effect=lambda: clock[0]):
             with self.assertRaisesRegex(USBError, "after 3 bytes"):
-                stream.sendall(b"abcdef")
+                stream.sendall(wire)
         with self.assertRaisesRegex(OSError, "replay prohibited"):
-            stream.sendall(b"abcdef")
+            stream.sendall(wire)
         self.assertEqual(len(calls), 1)
         self.assertTrue(stream.handle.cancel.is_set())
         self.assertEqual(stream.tx_bytes, 0)  # Whole logical writes only.
@@ -195,14 +290,15 @@ class NativeUSBTests(unittest.TestCase):
             cancel.set()
             return -7, 0
         stream, clock, calls, budgets, events = self.simulated_writer(transfer)
+        wire = Packet(CMD, HU_VERSION, protobuf(f1=2, f2=0)).encode()
         with patch("hu_lab.usb.time.monotonic", side_effect=lambda: clock[0]):
             with self.assertRaises(InterruptedError):
-                stream.sendall(b"version")
+                stream.sendall(wire)
         self.assertLess(clock[0] - 100, .201)
         self.assertEqual(len(calls), 1)
         stream.close()
         with self.assertRaises(OSError):
-            stream.sendall(b"version")
+            stream.sendall(wire)
 
     def test_writer_failure_remains_primary_when_cancelled_reader_wins_guard(self):
         cancel = threading.Event()

@@ -9,6 +9,7 @@ from unittest.mock import patch
 from hu_lab import windows_usb_interfaces as wi
 from hu_lab import windows_winusb as wn
 from hu_lab.public import prepare_usb
+from hu_lab.protocol import Packet, CMD, HU_VERSION, protobuf
 from tests.test_usb_acquisition import NORMAL, ACCESSORY, MemoryBus, SERIAL
 from tests.test_windows_usb_interfaces import PnP, OEM
 
@@ -102,10 +103,10 @@ class AutoSelectionTests(unittest.TestCase):
             self.assertEqual([x['result'] for x in evidence['examined']], ['adb_interface','selected'])
             self.assertNotIn('PrivateFunction',json.dumps(evidence))
             self.assertEqual(stream.handle.serial_sha256(),hashlib.sha256(SERIAL).hexdigest())
-            stream.sendall(b'VERSION')
+            stream.sendall(Packet(CMD, HU_VERSION, protobuf(f1=2, f2=0)).encode())
             self.assertEqual(stream.recv(16384),b'OK')
             stream.handle.hid_control(54,1)
-            self.assertEqual(self.api.data,[('write',1),('read',129),('control',0)])
+            self.assertEqual(self.api.data,[('write',1),('write',1),('read',129),('control',0)])
             self.assertEqual(self.api.bus.controls,[51]+[52]*6+[53])
             self.assertEqual(self.api.bus.opens,[NORMAL,NORMAL])  # never re-open AOA with libusb
             self.assertEqual(self.api.opened,[link('DisguisedAdb'),link('Right')])

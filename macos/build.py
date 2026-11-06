@@ -103,7 +103,7 @@ def main() -> int:
         shutil.rmtree(assets / "licenses")
     versions = collect_licenses(assets / "licenses", args.libusb)
     (assets / "build-info.json").write_text(json.dumps({
-        "name": "CarLife HeadUnit Emulator", "version": "0.4.0", "release_channel": "stable", "architecture": "arm64",
+        "name": "CarLife HeadUnit Emulator", "version": "0.4.1", "release_channel": "stable", "architecture": "arm64",
         "minimum_macos": "determined from bundled binaries", "python": platform.python_version(),
         "built_utc": datetime.now(timezone.utc).isoformat(), "dependencies": versions,
         "source_sha256": {str(path.relative_to(PROJECT)): hashlib.sha256(path.read_bytes()).hexdigest()
