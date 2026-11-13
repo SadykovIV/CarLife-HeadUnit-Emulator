@@ -6,7 +6,7 @@ from unittest.mock import patch
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 try:
     from PIL import Image
-    from PySide6.QtWidgets import QApplication, QFrame
+    from PySide6.QtWidgets import QApplication, QFrame, QWidget
     from hu_lab.desktop_cluster import ClusterPage, artwork_pixmap
     from hu_lab.desktop_theme import stylesheet
 except ImportError:
@@ -140,8 +140,14 @@ class ClusterDisplayTests(unittest.TestCase):
         state.consume(Packet(CMD, NAVI_NEXT_TURN_INFO, protobuf(f1=1, f2=3, f3=road, f5=350)))
         state.consume(Packet(CMD, MEDIA_INFO, protobuf(f2=song, f3='Исполнитель', f4='Альбом', f5=self.cover())))
         page = ClusterPage(lambda: None)
-        self.addCleanup(page.close)
+        # Production embeds this page in the inspector. Native window managers
+        # can impose a larger minimum width on a standalone decorated window.
+        inspector = QWidget()
+        inspector.resize(800, 600)
+        page.setParent(inspector)
+        self.addCleanup(inspector.close)
         page.refresh(state, demo=False)
+        inspector.show()
         page.show()
         for theme in ('light', 'dark'):
             page.setStyleSheet(stylesheet(theme))

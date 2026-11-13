@@ -7,6 +7,7 @@ VR is speaker audio; microphone uplink is a separate, unimplemented feature.
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import asdict, dataclass, field
+import logging
 import math
 import struct
 import threading
@@ -325,12 +326,15 @@ class _PlaybackOutput(QObject):
                 self.output_errors[channel] = (generation, str(error))
 
     def snapshot(self):
+        states = {channel: entry["sink"].state().name for channel, entry in self.outputs.items()}
+        return self._report(states)
+
+    def _report(self, states):
         lanes = self.buffer.snapshot()
         for channel, name in LANES.items():
-            entry = self.outputs.get(channel)
             error = self.output_errors.get(channel)
             lanes[name].update(written_bytes=self.written_bytes[channel],
-                               output_state=entry["sink"].state().name if entry else "STOPPED",
+                               output_state=states.get(channel, "STOPPED"),
                                output_error=error[1] if error else None)
         return {"lanes": lanes, "volume": self.volume, "muted": self.muted,
                 "device_id": self.device_id, "microphone": "DISABLED",
@@ -346,6 +350,23 @@ class _PlaybackOutput(QObject):
         self.timer.stop()
         self.buffer.reset(close=True)
         self._restart_outputs()
+
+    def close_and_snapshot(self):
+        stage = "close"
+        try:
+            self.close()
+            stage = "snapshot"
+            return self.snapshot()
+        except Exception as error:
+            logging.getLogger(__name__).exception("Audio output %s failed", stage)
+            self.closed = True
+            if not self.buffer.closed:
+                self.buffer.reset(close=True)
+            # A failed Qt sink can no longer be queried safely. Preserve the
+            # known PCM counters and settings before this thread exits.
+            report = self._report(dict.fromkeys(LANES, "UNKNOWN"))
+            report["cleanup_error"] = f"{stage}: {type(error).__name__}: {error}"
+            return report
 
 
 class DesktopAudioPlayer(QObject):
@@ -437,8 +458,7 @@ class DesktopAudioPlayer(QObject):
         if self._final_snapshot is not None:
             return
         try:
-            self._call(self._output.close)
-            self._final_snapshot = self._call(self._output.snapshot)
+            self._final_snapshot = self._call(self._output.close_and_snapshot)
         finally:
             self._thread.quit()
             self._thread.wait()

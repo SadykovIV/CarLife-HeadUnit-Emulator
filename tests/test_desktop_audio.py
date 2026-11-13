@@ -223,6 +223,37 @@ class QtPlaybackContractTest(unittest.TestCase):
         self.player.set_muted(False)
         self.assertEqual(sink.volume, .4)
 
+    def test_close_or_snapshot_failure_keeps_final_report_after_thread_exits(self):
+        for stage, target, method in (("close", _FakeSink, "reset"),
+                                      ("snapshot", audio._PlaybackOutput, "snapshot")):
+            with self.subTest(stage=stage):
+                threaded = audio.DesktopAudioPlayer()
+                try:
+                    threaded.set_volume(.4)
+                    threaded.submit(init())
+                    threaded.submit(Packet(MEDIA, audio.MEDIA_DATA, b"12345678"))
+                    threaded._call(threaded._output._pump)
+                    with patch.object(target, method, side_effect=RuntimeError("device unavailable")), \
+                            self.assertLogs(audio.__name__, level="ERROR") as logged:
+                        threaded.close()
+                    self.assertIn("device unavailable", logged.output[0])
+                    self.assertTrue(threaded.closed)
+                    self.assertFalse(threaded._thread.isRunning())
+                    with patch.object(threaded, "_call", side_effect=AssertionError("stopped worker")):
+                        report = threaded.snapshot()
+                        self.assertTrue(report["closed"])
+                        self.assertEqual(report["cleanup_error"], f"{stage}: RuntimeError: device unavailable")
+                        self.assertEqual(report["volume"], .4)
+                        media = report["lanes"]["MEDIA"]
+                        self.assertEqual(media["state"], "CLOSED")
+                        self.assertEqual(media["received_bytes"], 8)
+                        self.assertGreater(media["written_bytes"], 0)
+                        self.assertEqual(media["output_state"], "UNKNOWN")
+                        threaded.close()
+                finally:
+                    if threaded._thread.isRunning():
+                        threaded.close()
+
     def test_reinit_discards_old_partial_device_write(self):
         self.buffer.submit(init())
         self.buffer.submit(Packet(MEDIA, audio.MEDIA_DATA, b"old-data"))
