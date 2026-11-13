@@ -27,6 +27,26 @@ class DemoCluster:
         self.subscribed = set()
         self.started = None
         self.last_tick = self.last_song = None
+        self.artwork = {}
+
+    def cover(self, song):
+        """Original diagnostic artwork, sent as a real bounded JPEG field."""
+        if song not in self.artwork:
+            from io import BytesIO
+            from PIL import Image, ImageDraw
+            image = Image.new('RGB', (256, 256), '#122737')
+            draw = ImageDraw.Draw(image)
+            accent = ('#67c5c0', '#f4bd78')[song]
+            draw.ellipse((150, 24, 214, 88), fill=accent)
+            draw.polygon(((0, 165), (75, 87), (139, 159), (202, 110), (256, 170), (256, 256), (0, 256)),
+                         fill='#254c5e')
+            draw.polygon(((111, 256), (143, 161), (153, 161), (210, 256)), fill=accent)
+            draw.line(((150, 184), (155, 203)), fill='#122737', width=3)
+            draw.line(((162, 224), (169, 250)), fill='#122737', width=4)
+            output = BytesIO()
+            image.save(output, 'JPEG', quality=85)
+            self.artwork[song] = output.getvalue()
+        return self.artwork[song]
 
     def command(self, packet):
         if packet.message not in (SUBSCRIBE, SUBSCRIBE_START, SUBSCRIBE_STOP):
@@ -68,7 +88,7 @@ class DemoCluster:
             if song != self.last_song:
                 title, artist = self.tracks[song]
                 info = protobuf(f1='CarLife Demo', f2=title, f3=artist, f4='Демо-маршрут',
-                                f5=b'', f6=12, f7=2, f8=str(song), f9=0)
+                                f5=self.cover(song), f6=12, f7=2, f8=str(song), f9=0)
                 packets.append(Packet(CMD, MEDIA_INFO, info))
                 self.last_song = song
             packets.append(Packet(CMD, MEDIA_PROGRESS_BAR, protobuf(f1=tick % 12 * 1000)))

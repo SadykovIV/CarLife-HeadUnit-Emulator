@@ -16,6 +16,9 @@ SUBSCRIBE, SUBSCRIBE_DONE, SUBSCRIBE_START, SUBSCRIBE_STOP = 0x18043, 0x10044, 0
 MODULES = {0:'navigation',2:'music'}
 STATUS_IDS = {2:0,3:2}
 REQUEST_IDS = (0,1,2)
+# HeadSwap's wire sender converts albumArt to JPEG <30 KiB. The CMD frame
+# itself is limited to 65535 bytes; keep only one small cover per active track.
+MAX_ARTWORK_BYTES = 32768
 
 
 def _subscription(message, ids):
@@ -64,7 +67,7 @@ def _text(f,n):
 
 def _image(f,n):
     raw=f.get((n,2),b'')
-    return raw if len(raw)<=32768 else b''
+    return raw if len(raw)<=MAX_ARTWORK_BYTES else b''
 
 
 class ClusterState:

@@ -1,10 +1,11 @@
-"""Bounded CarLife PCM playback through Qt/CoreAudio on macOS.
+"""Bounded CarLife PCM playback through Qt Multimedia.
 
 The transport thread only calls ``submit``. All QAudioSink objects are owned
-and driven by the GUI thread. This module never opens a microphone. Incoming
+and driven by a dedicated Qt event loop. This module never opens a microphone. Incoming
 VR is speaker audio; microphone uplink is a separate, unimplemented feature.
 """
 from collections import deque
+from concurrent.futures import Future
 from dataclasses import asdict, dataclass, field
 import math
 import struct
@@ -188,45 +189,39 @@ class PCMPlaybackBuffer:
 
 # Keep queue tests and CLI imports usable without the optional desktop runtime.
 try:
-    from PySide6.QtCore import QObject, QTimer
+    from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
     from PySide6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
 except ImportError:
     QObject, QTimer = object, None
+    Signal = lambda *_: None
+    Slot = lambda *_: lambda function: function
 
 
-class DesktopAudioPlayer(QObject):
-    """Main-thread player; only submit() is intended for background threads.
-
-    Device IDs are stable hex strings returned by available_outputs(). A null
-    selection follows the macOS default output, including device changes.
-    """
-    def __init__(self, parent=None):
-        if QTimer is None:
-            raise RuntimeError("PySide6 QtMultimedia is required for desktop audio")
-        super().__init__(parent)
-        self.buffer = PCMPlaybackBuffer()
+class _PlaybackOutput(QObject):
+    """All Qt audio devices, sinks and timers have the affinity of this object."""
+    def __init__(self, buffer):
+        super().__init__()
+        self.buffer = buffer
         self.volume, self.muted = .7, False
         self.device_id = None
         self.outputs = {}
         self.output_errors = {}
         self.written_bytes = {channel: 0 for channel in LANES}
         self.closed = False
+        self.timer = None
+
+    @Slot(object)
+    def execute(self, operation):
+        operation()
+
+    def start(self):
         self.devices = QMediaDevices(self)
         self.devices.audioOutputsChanged.connect(self._restart_outputs)
         self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.setInterval(10)
         self.timer.timeout.connect(self._pump)
         self.timer.start()
-
-    def submit(self, packet):
-        return self.buffer.submit(packet)
-
-    @staticmethod
-    def available_outputs():
-        default = bytes(QMediaDevices.defaultAudioOutput().id()).hex()
-        return [{"id": bytes(device.id()).hex(), "name": device.description(),
-                 "default": bytes(device.id()).hex() == default}
-                for device in QMediaDevices.audioOutputs()]
 
     def set_output_device(self, device_id=None):
         if isinstance(device_id, bytes):
@@ -269,7 +264,7 @@ class DesktopAudioPlayer(QObject):
     def _start_output(self, channel, generation, pcm):
         device = self._device()
         if device.isNull():
-            raise RuntimeError("No macOS audio output is available")
+            raise RuntimeError("No audio output device is available")
         fmt = QAudioFormat()
         fmt.setSampleRate(pcm.sample_rate)
         fmt.setChannelCount(pcm.channels)
@@ -339,15 +334,7 @@ class DesktopAudioPlayer(QObject):
                                output_error=error[1] if error else None)
         return {"lanes": lanes, "volume": self.volume, "muted": self.muted,
                 "device_id": self.device_id, "microphone": "DISABLED",
-                "backend": "Qt QAudioSink / CoreAudio", "closed": self.closed}
-
-    def test_tone(self):
-        """Explicit local 150 ms, quiet 440 Hz speaker test on the VR lane."""
-        rate, frames = 48000, 7200
-        pcm = b"".join(struct.pack("<h", int(2600 * math.sin(2 * math.pi * 440 * i / rate)
-                        * min(1., i / 240, (frames - i - 1) / 240))) for i in range(frames))
-        self.submit(Packet(VR, VR_INIT, protobuf(f1=rate, f2=1, f3=16)))
-        self.submit(Packet(VR, VR_DATA, pcm))
+                "backend": "Qt QAudioSink", "closed": self.closed}
 
     def reset(self):
         self.buffer.reset(clear_statistics=True)
@@ -359,3 +346,99 @@ class DesktopAudioPlayer(QObject):
         self.timer.stop()
         self.buffer.reset(close=True)
         self._restart_outputs()
+
+
+class DesktopAudioPlayer(QObject):
+    """Accept packets from the transport and keep speaker writes independent of GUI input."""
+    _dispatch = Signal(object)
+
+    def __init__(self, parent=None):
+        if QTimer is None:
+            raise RuntimeError("PySide6 QtMultimedia is required for desktop audio")
+        super().__init__(parent)
+        self.buffer = PCMPlaybackBuffer()
+        self._final_snapshot = None
+        self._thread = QThread(self)
+        self._thread.setObjectName("CarLife audio")
+        self._output = _PlaybackOutput(self.buffer)
+        self._output.moveToThread(self._thread)
+        self._dispatch.connect(self._output.execute, Qt.ConnectionType.QueuedConnection)
+        self._thread.finished.connect(self._output.deleteLater)
+        self._thread.start()
+        try:
+            self._call(self._output.start)
+        except Exception:
+            self._thread.quit()
+            self._thread.wait()
+            raise
+
+    @property
+    def closed(self):
+        return self._final_snapshot is not None
+
+    @property
+    def muted(self):
+        return self.snapshot()["muted"]
+
+    def _call(self, function, *args):
+        # Controls, snapshots and resets are synchronous for UI callers. The PCM
+        # reader only submits to the bounded buffer and never waits for a Qt call.
+        done = Future()
+
+        def run():
+            try:
+                done.set_result(function(*args))
+            except Exception as error:
+                done.set_exception(error)
+
+        self._dispatch.emit(run)
+        return done.result()
+
+    def submit(self, packet):
+        return self.buffer.submit(packet)
+
+    @staticmethod
+    def available_outputs():
+        default = bytes(QMediaDevices.defaultAudioOutput().id()).hex()
+        return [{"id": bytes(device.id()).hex(), "name": device.description(),
+                 "default": bytes(device.id()).hex() == default}
+                for device in QMediaDevices.audioOutputs()]
+
+    def set_output_device(self, device_id=None):
+        if self._final_snapshot is None:
+            self._call(self._output.set_output_device, device_id)
+
+    def set_volume(self, value):
+        if self._final_snapshot is None:
+            self._call(self._output.set_volume, value)
+
+    def set_muted(self, muted):
+        if self._final_snapshot is None:
+            self._call(self._output.set_muted, muted)
+
+    def snapshot(self):
+        if self._final_snapshot is not None:
+            return self._final_snapshot
+        return self._call(self._output.snapshot)
+
+    def test_tone(self):
+        """Explicit local 150 ms, quiet 440 Hz speaker test on the VR lane."""
+        rate, frames = 48000, 7200
+        pcm = b"".join(struct.pack("<h", int(2600 * math.sin(2 * math.pi * 440 * i / rate)
+                        * min(1., i / 240, (frames - i - 1) / 240))) for i in range(frames))
+        self.submit(Packet(VR, VR_INIT, protobuf(f1=rate, f2=1, f3=16)))
+        self.submit(Packet(VR, VR_DATA, pcm))
+
+    def reset(self):
+        if self._final_snapshot is None:
+            self._call(self._output.reset)
+
+    def close(self):
+        if self._final_snapshot is not None:
+            return
+        try:
+            self._call(self._output.close)
+            self._final_snapshot = self._call(self._output.snapshot)
+        finally:
+            self._thread.quit()
+            self._thread.wait()

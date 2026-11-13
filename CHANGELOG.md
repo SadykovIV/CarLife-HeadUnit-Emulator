@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/tag/v0.5.1) — 2026-11-13
+
+- Connect to a compatible phone over Wi-Fi. Put both devices on the same network or use the phone hotspot, then discover the phone or enter its IP address.
+- Move, zoom and rotate maps with independent contacts on a Mac trackpad or a touchscreen. Legacy dual supports two fingers. Compatible devices can use up to four with Action3.
+- Show received JPEG or PNG album covers beside the track title and artist in the instrument cluster. Switching to a track without artwork clears the previous cover.
+- Keep music and voice prompts playing while the window processes gestures or redraws the projection.
+
 ## [0.4.1](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/tag/v0.4.1) — 2026-11-06
 
 - Fix USB connection to Wizcar A2, which could enter accessory mode but fail protocol negotiation. Send the 8-byte channel header and message body in separate USB transfers, matching Baidu HU framing, while preserving the write deadline and protection against replay after a failed write.

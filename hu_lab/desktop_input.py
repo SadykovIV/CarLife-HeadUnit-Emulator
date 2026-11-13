@@ -15,6 +15,77 @@ from .touch import (DOWN, MOVE, POINTER_DOWN, POINTER_UP, UP,
                     Pointer, TouchFrame, profile_name)
 
 
+def contact_limit(profile):
+    """UI limit: stock dual wire has two slots; explicit Action3 has four."""
+    return {"LEGACY_SINGLE": 1, "LEGACY_DUAL": 2, "ACTION3_MULTI": 4}[profile_name(profile)]
+
+
+class DesktopInputArbiter:
+    """One physical gesture owns projection input until it is released.
+
+    In particular AppKit may deliver a mouse click and native zoom alongside
+    indirect contacts. A click must not replace those contacts, and fingers
+    left on the trackpad after cancellation must not begin another gesture.
+    """
+    def __init__(self):
+        self.pointer_pressed = False
+        self.touch_active = False
+        self.touch_count = 0
+        self.suppress_pointer = False
+        self.suppress_touches = False
+
+    def pointer(self, phase):
+        if phase == "down":
+            if self.touch_active:
+                self.suppress_pointer = True
+                return False
+            if self.pointer_pressed:
+                return False
+            self.suppress_pointer = False
+            self.pointer_pressed = True
+            return True
+        if phase == "move":
+            return self.pointer_pressed and not self.touch_active and not self.suppress_pointer
+        if phase == "up":
+            accepted = self.pointer_pressed
+            self.pointer_pressed = self.suppress_pointer = False
+            return accepted
+        raise ValueError("unknown pointer phase")
+
+    def contacts(self, count, limit, *, indirect):
+        self.touch_count = count
+        if not count:
+            self.suppress_touches = False
+            active, self.touch_active = self.touch_active, False
+            return "update" if active else "ignore"
+        if not self.touch_active and (self.pointer_pressed or self.suppress_pointer):
+            self.suppress_touches = True
+            return "ignore"
+        if self.suppress_touches:
+            return "ignore"
+        minimum = 2 if indirect else 1
+        if limit < minimum or count > limit:
+            active, self.touch_active = self.touch_active, False
+            self.suppress_touches = True
+            return "cancel" if active else "ignore"
+        if not self.touch_active and count < minimum:
+            return "ignore"
+        self.touch_active = True
+        return "update"
+
+    @property
+    def blocks_native_gesture(self):
+        return bool(self.touch_count or self.touch_active or self.suppress_touches or
+                    self.pointer_pressed or self.suppress_pointer)
+
+    def cancel(self):
+        if self.pointer_pressed:
+            self.suppress_pointer = True
+        if self.touch_active or self.touch_count:
+            self.suppress_touches = True
+        self.pointer_pressed = self.touch_active = False
+
+
 class DesktopTouchInput:
     """Translate live contact sets and continuous pinch input to Android actions.
 
@@ -75,9 +146,11 @@ class DesktopTouchInput:
         if generation != client.decoder_generation:
             raise ProtocolError("touch generation differs from displayed video")
         profile = profile_name(client.touch_profile)
-        maximum = 1 if profile == "LEGACY_SINGLE" else 2
+        maximum = contact_limit(profile)
         if len(values) > maximum:
-            raise ProtocolError("two contacts require Legacy dual or Action3 multi")
+            if maximum == 1:
+                raise ProtocolError("two contacts require Legacy dual or Action3 multi")
+            raise ProtocolError(f"selected touch profile permits at most {maximum} contacts")
         ids = [item[0] for item in values]
         if any(type(i) is not int for i in ids) or len(set(ids)) != len(ids):
             raise ProtocolError("touch contact IDs must be unique integers")
@@ -88,7 +161,7 @@ class DesktopTouchInput:
     def contacts(self, client, values, generation, source="qt_touch", released=()):
         """Apply the complete current contact set; release disappeared IDs first.
 
-        Wire IDs 0/1 survive Qt list reordering and first-finger release. This
+        Wire IDs survive Qt list reordering and first-finger release. This
         also makes the sequence reconstructable by the legacy dual decoder.
         A contact replaced in the same event is released before its ID is reused.
         Optional ``released`` contains final positions for lifted Qt contacts;
@@ -132,7 +205,7 @@ class DesktopTouchInput:
             for external_id, x, y in values:
                 if external_id not in self._points:
                     used = {p.id for p in self._points.values()}
-                    wire_id = next(i for i in (0, 1) if i not in used)
+                    wire_id = next(i for i in range(contact_limit(client.touch_profile)) if i not in used)
                     pointer = Pointer(wire_id, x, y)
                     points = self.pointers + (pointer,)
                     self._send(DOWN if not self._points else POINTER_DOWN, points,

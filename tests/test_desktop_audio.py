@@ -2,6 +2,7 @@
 from types import SimpleNamespace
 import os
 import threading
+import time
 import unittest
 from tests import dispose_qt_object
 from unittest.mock import patch
@@ -176,7 +177,9 @@ class QtPlaybackContractTest(unittest.TestCase):
         self.devices.start()
         self.sinks.start()
         _FakeSink.instances = []
-        self.player = audio.DesktopAudioPlayer()
+        self.buffer = audio.PCMPlaybackBuffer()
+        self.player = audio._PlaybackOutput(self.buffer)
+        self.player.start()
         self.player.timer.stop()
 
     def tearDown(self):
@@ -185,10 +188,31 @@ class QtPlaybackContractTest(unittest.TestCase):
         self.devices.stop()
         self.sinks.stop()
 
+    def test_speaker_writes_continue_while_gui_event_loop_is_busy(self):
+        threaded = audio.DesktopAudioPlayer()
+        try:
+            payload = b"1234" * 4
+            threaded.submit(init())
+            threaded.submit(Packet(MEDIA, audio.MEDIA_DATA, payload))
+            deadline = time.monotonic() + 1
+            # No main-thread Qt events are serviced while simulating a busy GUI.
+            while time.monotonic() < deadline:
+                if _FakeSink.instances and len(_FakeSink.instances[0].data) == len(payload):
+                    break
+                time.sleep(.01)
+            self.assertEqual(bytes(_FakeSink.instances[0].data), payload)
+            self.assertEqual(threaded.snapshot()["lanes"]["MEDIA"]["dropped_bytes"], 0)
+            threaded.reset()
+            self.assertEqual(threaded.snapshot()["lanes"]["MEDIA"]["written_bytes"], 0)
+        finally:
+            threaded.close()
+        self.assertTrue(threaded.snapshot()["closed"])
+        threaded.close()
+
     def test_short_device_writes_preserve_every_byte_and_volume(self):
         self.player.set_volume(.4)
-        self.player.submit(init())
-        self.player.submit(Packet(MEDIA, audio.MEDIA_DATA, b"12345678"))
+        self.buffer.submit(init())
+        self.buffer.submit(Packet(MEDIA, audio.MEDIA_DATA, b"12345678"))
         for _ in range(4):
             self.player._pump()
         sink = _FakeSink.instances[0]
@@ -200,12 +224,12 @@ class QtPlaybackContractTest(unittest.TestCase):
         self.assertEqual(sink.volume, .4)
 
     def test_reinit_discards_old_partial_device_write(self):
-        self.player.submit(init())
-        self.player.submit(Packet(MEDIA, audio.MEDIA_DATA, b"old-data"))
+        self.buffer.submit(init())
+        self.buffer.submit(Packet(MEDIA, audio.MEDIA_DATA, b"old-data"))
         self.player._pump()  # old sink accepts three bytes only.
         old = _FakeSink.instances[0]
-        self.player.submit(init(rate=16000, channels=1))
-        self.player.submit(Packet(MEDIA, audio.MEDIA_DATA, b"NEW!"))
+        self.buffer.submit(init(rate=16000, channels=1))
+        self.buffer.submit(Packet(MEDIA, audio.MEDIA_DATA, b"NEW!"))
         self.player._pump()
         self.player._pump()
         self.assertTrue(old.was_reset)
@@ -213,7 +237,7 @@ class QtPlaybackContractTest(unittest.TestCase):
 
     def test_disconnected_output_is_visible_without_silent_fallback(self):
         self.player.set_output_device("missing")
-        self.player.submit(init())
+        self.buffer.submit(init())
         self.player._pump()
         row = self.player.snapshot()["lanes"]["MEDIA"]
         self.assertIn("disconnected", row["output_error"])
@@ -223,8 +247,8 @@ class QtPlaybackContractTest(unittest.TestCase):
         self.assertIsNone(self.player.snapshot()["lanes"]["MEDIA"]["output_error"])
 
     def test_new_session_resets_counters_and_old_sink(self):
-        self.player.submit(init())
-        self.player.submit(Packet(MEDIA, audio.MEDIA_DATA, b"1234"))
+        self.buffer.submit(init())
+        self.buffer.submit(Packet(MEDIA, audio.MEDIA_DATA, b"1234"))
         self.player._pump()
         old_sink = _FakeSink.instances[0]
         self.player.reset()

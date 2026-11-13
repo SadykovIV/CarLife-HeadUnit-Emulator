@@ -6,7 +6,7 @@ on:
       tag:
         description: Release tag whose Windows ZIP should be tested
         required: true
-        default: v0.4.1
+        default: v0.5.1
         type: string
       expected_sha256:
         description: Expected SHA256 of the complete Windows ZIP

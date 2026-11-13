@@ -1,4 +1,4 @@
-"""Cross-platform HeadUnit desktop application. UI and audio stay on the Qt main thread."""
+"""Cross-platform HeadUnit desktop application. Audio playback uses a dedicated Qt thread."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -12,7 +12,7 @@ import threading
 import time
 
 from PySide6.QtCore import Qt, QEvent, QPointF, QRectF, QTimer, QUrl
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QImage, QEventPoint, QKeySequence, QPainter, QPalette, QPixmap, QTransform
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QImage, QEventPoint, QInputDevice, QKeySequence, QPainter, QPalette, QPixmap, QTransform
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSlider,
@@ -20,8 +20,10 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBo
 from .desktop_audio import DesktopAudioPlayer
 from .desktop_cluster import ClusterPage
 from .desktop_session import DesktopConfig, create_client, list_usb_devices
+from .wireless import discover_phones
 from .desktop_demo import DemoPeer
-from .desktop_input import DesktopTouchInput
+from .desktop_input import DesktopInputArbiter, DesktopTouchInput, contact_limit
+from .macos_touch import MacOSTrackpad
 from .desktop_theme import stylesheet
 from .keyboard_input import HIDKeyboard, qt_keyboard_command
 from .geometry import Rect, ViewportTransform
@@ -31,7 +33,7 @@ from .windows_driver_setup import inspect_setup, apply_setup
 from .frame_wake import FrameWake
 from .macos_activity import UserInitiatedActivity
 
-VERSION = "0.4.1"
+VERSION = "0.5.1"
 
 
 DESKTOP_PROFILE = 'honda-v2'
@@ -137,11 +139,17 @@ class VideoSurface(QWidget):
         self.generation = -1
         self.pressed = False
         self.touch_input = DesktopTouchInput()
+        self.input_arbiter = DesktopInputArbiter()
+        self.trackpad = MacOSTrackpad()
+        self.native_cancelled = False
         self.input_source = None
         self.wheel_finish = QTimer(self)
         self.wheel_finish.setSingleShot(True)
         self.wheel_finish.timeout.connect(self.finish_contacts)
         self.setAttribute(Qt.WA_AcceptTouchEvents)
+        # Receive the final surviving finger as well as the initial single
+        # finger. The arbiter starts indirect input only when a second arrives.
+        self.setAttribute(Qt.WA_TouchPadAcceptSingleTouchEvents)
         self.setAttribute(Qt.WA_InputMethodEnabled)
         self.setMinimumSize(480, 270)
         self.setMouseTracking(True)
@@ -184,6 +192,13 @@ class VideoSurface(QWidget):
                 'CarLife HeadUnit Emulator\n\nВыберите устройство сверху и нажмите «Подключить»\n\nЭкран · Звук · Управление')
 
     def cancel(self, reason):
+        self.input_arbiter.cancel()
+        if self.input_source == 'native_zoom':
+            self.native_cancelled = True
+        self._cancel_remote(reason)
+
+    def _cancel_remote(self, reason):
+        """Release protocol contacts without forgetting physical ownership."""
         self.wheel_finish.stop()
         self.owner.gesture_frames.clear()
         if self.touch_input.active:
@@ -234,7 +249,7 @@ class VideoSurface(QWidget):
 
     def begin_pinch(self, point, source):
         self.owner.cancel_typing()
-        self.cancel('new_' + source)
+        self._cancel_remote('new_' + source)
         success = self.owner.invoke(lambda: self.touch_input.begin_pinch(
             self.owner.client, *point, self.generation, source=source,
             bounds=self.visible_video_bounds()), quiet=True)
@@ -242,8 +257,88 @@ class VideoSurface(QWidget):
         self.update()
         return success
 
+    def normalized_trackpad_point(self, x, y):
+        """Map the whole pad to visible MD content, including display rotation."""
+        client = self.owner.client
+        bounds = self.visible_video_bounds()
+        if client is None or bounds is None:
+            return None
+        content = self.touch_input._content(client)
+        left, top = max(bounds.x, content.x), max(bounds.y, content.y)
+        right = min(bounds.x + bounds.width, content.x + content.width) - 1
+        bottom = min(bounds.y + bounds.height, content.y + content.height) - 1
+        if right < left or bottom < top:
+            return None
+        corners = [self.transform.video_to_view(px, py)
+                   for px in (math.ceil(left), math.floor(right))
+                   for py in (math.ceil(top), math.floor(bottom))]
+        xs, ys = zip(*corners)
+        return self.mapped_point(QPointF(min(xs) + x * (max(xs) - min(xs)),
+                                        min(ys) + y * (max(ys) - min(ys))))
+
+    def touch_event(self, event):
+        kind = event.type()
+        if kind == QEvent.TouchCancel:
+            self.cancel('qt_touch_cancel')
+            return
+        device = event.pointingDevice()
+        indirect = device is not None and device.type() == QInputDevice.DeviceType.TouchPad
+        native = (self.trackpad.read(event.timestamp()) if indirect and
+                  QApplication.platformName() == 'cocoa' else None)
+        if native is not None and native.cancelled:
+            self.cancel('trackpad_cancel')
+            return
+        if native is not None:
+            active, lifted = native.contacts, native.released
+            source = 'trackpad'
+            mapper = lambda item: self.normalized_trackpad_point(item[1], item[2])
+        else:
+            active, lifted = [], []
+            for point in event.points():
+                target = lifted if kind == QEvent.TouchEnd or point.state() == QEventPoint.State.Released else active
+                target.append((point.id(), point.position()))
+            source = 'qt_trackpad' if indirect else 'qt_touch'
+            mapper = lambda item: self.mapped_point(item[1])
+        client = self.owner.client
+        maximum = contact_limit(client.touch_profile) if client else 0
+        action = self.input_arbiter.contacts(len(active), maximum, indirect=indirect)
+        if action == 'ignore':
+            return
+        if action == 'cancel':
+            self._cancel_remote('touch_contact_limit')
+            return
+        if self.input_source not in ('trackpad', 'qt_trackpad', 'qt_touch'):
+            if not active:
+                return
+            self.setFocus()
+            self.owner.cancel_typing()
+            self._cancel_remote('touch_begin')
+            self.input_source = source
+        elif self.input_source != source:
+            # Do not mix AppKit identity values and Qt point IDs midway through
+            # an interaction if a native event could not be verified.
+            self.cancel('touch_source_changed')
+            return
+        values, released = [], []
+        for rows, output in ((active, values), (lifted, released)):
+            for item in rows:
+                mapped = mapper(item)
+                if mapped is None:
+                    self.cancel('touch_outside_video')
+                    return
+                output.append((item[0], *mapped))
+        success = self.owner.invoke(lambda: self.touch_input.contacts(
+            client, values, self.generation, source=source, released=released), quiet=True)
+        if not success:
+            self.cancel('touch_send_failed')
+        elif not values:
+            self.input_source = None
+        self.update()
+
     def event(self, event):
         kind = event.type()
+        if kind in (QEvent.WindowDeactivate, QEvent.Hide):
+            self.cancel('surface_inactive')
         if (kind == QEvent.ShortcutOverride and self.owner.keyboard_ready()
                 and not event.matches(QKeySequence.Quit)):
             # Let the subsequent key press reach Android while the projection
@@ -258,39 +353,21 @@ class VideoSurface(QWidget):
                 event.accept()
                 return True
         if kind in (QEvent.TouchBegin, QEvent.TouchUpdate, QEvent.TouchEnd, QEvent.TouchCancel):
-            if kind == QEvent.TouchCancel:
-                self.cancel('qt_touch_cancel')
-            else:
-                if kind == QEvent.TouchBegin:
-                    self.setFocus()
-                    self.owner.cancel_typing()
-                    self.cancel('qt_touch_begin')
-                    self.input_source = 'qt_touch'
-                elif self.input_source != 'qt_touch':
-                    # A canceled drag must not restart when the same fingers
-                    # move back from a letterbox or an inactive tab.
-                    event.accept()
-                    return True
-                values, released = [], []
-                for point in event.points():
-                    mapped = self.mapped_point(point.position())
-                    if mapped is None:
-                        self.cancel('touch_outside_video')
-                        event.accept()
-                        return True
-                    target = released if kind == QEvent.TouchEnd or point.state() == QEventPoint.State.Released else values
-                    target.append((point.id(), *mapped))
-                self.owner.invoke(lambda: self.touch_input.contacts(
-                    self.owner.client, values, self.generation, released=released), quiet=True)
-                if not values: self.input_source = None
-                self.update()
+            self.touch_event(event)
             event.accept()
             return True
         if kind == QEvent.NativeGesture:
             gesture = event.gestureType()
             if gesture == Qt.NativeGestureType.EndNativeGesture:
                 if self.input_source == 'native_zoom': self.finish_contacts()
+                self.native_cancelled = False
+            elif gesture == Qt.NativeGestureType.BeginNativeGesture:
+                self.native_cancelled = self.input_arbiter.blocks_native_gesture
             elif gesture == Qt.NativeGestureType.ZoomNativeGesture:
+                if self.input_arbiter.blocks_native_gesture or self.native_cancelled:
+                    self.native_cancelled = True
+                    event.accept()
+                    return True
                 point = self.point(event)
                 if point is not None:
                     self.setFocus()
@@ -309,9 +386,15 @@ class VideoSurface(QWidget):
     def mousePressEvent(self, event):
         if event.button() != Qt.LeftButton:
             return
+        if event.source() != Qt.MouseEventSource.MouseEventNotSynthesized:
+            event.accept()
+            return
+        if not self.input_arbiter.pointer('down'):
+            event.accept()
+            return
         self.setFocus()
         self.owner.cancel_typing()
-        self.cancel('new_mouse_press')
+        self._cancel_remote('new_mouse_press')
         point = self.point(event)
         if point:
             if event.modifiers() & Qt.AltModifier:
@@ -319,12 +402,14 @@ class VideoSurface(QWidget):
             else:
                 self.pressed = self.owner.invoke(lambda: self.owner.client.touch(0, *point), quiet=True)
             event.accept()
+        if not self.pressed:
+            self.input_arbiter.cancel()
 
     def mouseDoubleClickEvent(self, event):
         self.mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self.pressed:
+        if self.pressed and self.input_arbiter.pointer('move'):
             point = self.point(event)
             if point:
                 if self.input_source == 'alt_mouse':
@@ -336,7 +421,10 @@ class VideoSurface(QWidget):
                 self.cancel('pointer_outside_video')
 
     def mouseReleaseEvent(self, event):
-        if self.pressed and event.button() == Qt.LeftButton:
+        if event.button() != Qt.LeftButton or event.source() != Qt.MouseEventSource.MouseEventNotSynthesized:
+            return
+        accepted = self.input_arbiter.pointer('up')
+        if self.pressed and accepted:
             if self.input_source == 'alt_mouse':
                 point = self.point(event)
                 if point is None:
@@ -354,6 +442,9 @@ class VideoSurface(QWidget):
 
     def wheelEvent(self, event):
         if event.modifiers() & (Qt.ControlModifier | Qt.MetaModifier):
+            if self.input_arbiter.blocks_native_gesture:
+                event.accept()
+                return
             point = self.point(event)
             if point:
                 self.setFocus()
@@ -456,7 +547,7 @@ class HeadUnitWindow(QMainWindow):
         titles.addWidget(label(f'{VERSION} · {system}', 'muted'))
         bar.addLayout(titles)
         self.transport = QComboBox()
-        for text, value in [('USB', 'usb'), ('TCP', 'tcp'), ('Демо', 'demo')]:
+        for text, value in [('USB', 'usb'), ('Wi-Fi', 'wifi'), ('TCP', 'tcp'), ('Демо', 'demo')]:
             self.transport.addItem(text, value)
         self.transport.setFixedWidth(90)
         self.transport.setToolTip('Способ подключения')
@@ -483,12 +574,30 @@ class HeadUnitWindow(QMainWindow):
         self.port.setFixedWidth(90)
         tcp_bar.addWidget(self.host, 1); tcp_bar.addWidget(self.port)
         bar.addWidget(self.tcp_group, 1)
+        self.wifi_group = QWidget()
+        wifi_bar = QHBoxLayout(self.wifi_group)
+        wifi_bar.setContentsMargins(0, 0, 0, 0)
+        self.wifi_host = QComboBox()
+        self.wifi_host.setEditable(True)
+        self.wifi_host.setInsertPolicy(QComboBox.NoInsert)
+        self.wifi_host.lineEdit().setPlaceholderText('IP телефона в сети Wi-Fi')
+        self.wifi_host.setMinimumWidth(180)
+        self.wifi_host.setToolTip('Выберите найденный телефон или введите его IP. Порты CarLife определяются автоматически.')
+        wifi_bar.addWidget(self.wifi_host, 1)
+        self.wifi_scan = button('Найти', self.refresh_wifi)
+        self.wifi_scan.setToolTip('Искать телефоны CarLife в общей сети в течение 5 секунд')
+        wifi_bar.addWidget(self.wifi_scan)
+        bar.addWidget(self.wifi_group, 1)
         self.demo_header = label('Встроенное устройство · без USB', 'muted')
         bar.addWidget(self.demo_header, 1)
         self.connect_button = button('Подключить', self.connect_session, True)
         self.disconnect_button = button('Отключить', self.disconnect_session)
         bar.addWidget(self.connect_button); bar.addWidget(self.disconnect_button)
         layout.addWidget(self.header)
+        self.wifi_hint = label('Wi-Fi: подключите компьютер и телефон к одной сети или точке доступа телефона. '
+            'В HeadSwap выберите Wi-Fi и нажмите «Подключить», затем найдите телефон здесь.', 'muted', wrap=True)
+        self.wifi_hint.setContentsMargins(18, 6, 18, 6)
+        layout.addWidget(self.wifi_hint)
 
         navigation = QHBoxLayout()
         navigation.setContentsMargins(18, 10, 18, 10)
@@ -908,10 +1017,30 @@ class HeadUnitWindow(QMainWindow):
         kind = self.transport.currentData()
         self.usb_group.setVisible(kind == 'usb')
         self.tcp_group.setVisible(kind == 'tcp')
+        self.wifi_group.setVisible(kind == 'wifi')
+        self.wifi_hint.setVisible(kind == 'wifi')
         self.demo_group.setVisible(kind == 'demo')
         self.demo_header.setVisible(kind == 'demo')
         if hasattr(self, 'driver_group'):
             self.driver_group.setVisible(_windows_driver_ui() and kind == 'usb')
+
+    def refresh_wifi(self):
+        if self.busy or self.client or self.closing:
+            return
+        self.error_label.hide()
+        previous = self.wifi_host.currentText().strip()
+        self.log_event('Wi-Fi: поиск телефонов CarLife…')
+        def done(phones):
+            self.wifi_host.clear()
+            for phone in phones:
+                self.wifi_host.addItem(phone.host)
+            if previous and (not phones or any(phone.host == previous for phone in phones)):
+                self.wifi_host.setEditText(previous)
+            self.log_event(f'Wi-Fi: найдено телефонов {len(phones)}')
+            if not phones:
+                self.show_error('Телефон не найден. Включите Wi-Fi-подключение в HeadSwap. '
+                    'Если сеть блокирует обнаружение, введите IP телефона вручную; проверьте брандмауэр и изоляцию клиентов Wi-Fi.')
+        self.submit(discover_phones, done)
 
     def _confirm_driver_setup(self, plan):
         dialog = QMessageBox(self)
@@ -1046,7 +1175,9 @@ class HeadUnitWindow(QMainWindow):
         if self.width.value() % 2 or self.height.value() % 2:
             raise ValueError('Для H.264 выберите чётные ширину и высоту.')
         return DesktopConfig(transport='tcp' if kind == 'demo' else kind,
-            profile=DESKTOP_PROFILE, host=self.host.text().strip(), port=self.port.value(),
+            profile=DESKTOP_PROFILE,
+            host=self.wifi_host.currentText().strip() if kind == 'wifi' else self.host.text().strip(),
+            port=7240 if kind == 'wifi' else self.port.value(),
             usb_identity=USBIdentity(**{**ident,'ports':tuple(ident['ports'])}) if kind == 'usb' else None,
             width=self.width.value(),height=self.height.value(),fps=self.fps.value(),
             touch_profile=self.touch_profile.currentData(),audio_capture=self.capture.isChecked(),
@@ -1091,7 +1222,7 @@ class HeadUnitWindow(QMainWindow):
                        architecture=platform.machine(), attempt_id=output.name, session_id=None,
                        state='CONNECTING', started_at=started_at.isoformat(), error=None, demo=demo_mode,
                        transport=kind, profile=DESKTOP_PROFILE,
-                       backend='DIRECT_USB_AOA' if kind == 'usb' else 'TCP_STREAM',
+                       backend='DIRECT_USB_AOA' if kind == 'usb' else 'TCP6_WIFI' if kind == 'wifi' else 'TCP_STREAM',
                        selected_identity=selected, decoded_frames=0)
         self.last_report = attempt
         self.log_event('Подключение…')
@@ -1371,7 +1502,8 @@ class HeadUnitWindow(QMainWindow):
         self.scan_button.setEnabled(not connected and not self.busy)
         if hasattr(self, 'driver_button'):
             self.driver_button.setEnabled(not connected and not self.busy and not self.closing)
-        for widget in (self.transport, self.usb_devices, self.host, self.port, self.touch_profile, self.hid_enabled):
+        for widget in (self.transport, self.usb_devices, self.host, self.port, self.wifi_host,
+                       self.wifi_scan, self.touch_profile, self.hid_enabled):
             widget.setEnabled(not connected and not self.busy)
         self.reset_button.setEnabled(bool(streaming))
         self.pause_button.setEnabled(bool(connected and not self.busy and self.client.session.state in ('STREAMING','PAUSED')))
@@ -1481,6 +1613,7 @@ class HeadUnitWindow(QMainWindow):
         for name in ('width','height','fps','port','volume'):
             if isinstance(saved.get(name),int): getattr(self,name).setValue(saved[name])
         if isinstance(saved.get('host'),str): self.host.setText(saved['host'])
+        if isinstance(saved.get('wifi_host'),str): self.wifi_host.setEditText(saved['wifi_host'])
         self.muted.setChecked(saved.get('muted',False))
         self.hid_enabled.setChecked(saved.get('hid_enabled', True))
         self.fallback.setChecked(saved.get('fallback',True))
@@ -1491,6 +1624,7 @@ class HeadUnitWindow(QMainWindow):
     def save_settings(self):
         saved = {name:getattr(self,name).currentData() for name in ('transport','touch_profile','fit','rotation','theme','keyboard_layout')}
         saved['profile'] = DESKTOP_PROFILE
+        saved['wifi_host'] = self.wifi_host.currentText().strip()
         saved.update({name:getattr(self,name).value() for name in ('width','height','fps','port','volume')})
         saved.update(host=self.host.text(),muted=self.muted.isChecked(),fallback=self.fallback.isChecked(), settings_version=2, hid_enabled=self.hid_enabled.isChecked())
         temporary = self.data_dir/'settings.json.tmp'
@@ -1529,6 +1663,7 @@ def main(argv=None):
     parser.add_argument('--data-dir',type=Path,default=default_data_dir())
     parser.add_argument('--demo',action='store_true')
     parser.add_argument('--usb',metavar='PHYSICAL_KEY',help='connect only this explicitly selected USB port')
+    parser.add_argument('--wifi',metavar='PHONE_IP',help='connect native CarLife over six Wi-Fi TCP channels')
     parser.add_argument('--aoa-start',action='store_true',help='compatibility option; AOA is always enabled for the selected --usb device')
     parser.add_argument('--profile',choices=(DESKTOP_PROFILE,),
                         help='compatibility option; desktop sessions always use Honda v2')
@@ -1537,8 +1672,8 @@ def main(argv=None):
     parser.add_argument('--fps',type=int)
     parser.add_argument('--smoke-test',type=float,metavar='SECONDS')
     arguments = parser.parse_args(argv)
-    if arguments.demo and arguments.usb:
-        parser.error('--demo and --usb are mutually exclusive')
+    if sum(bool(value) for value in (arguments.demo, arguments.usb, arguments.wifi)) > 1:
+        parser.error('--demo, --usb and --wifi are mutually exclusive')
     if arguments.aoa_start and not arguments.usb:
         parser.error('--aoa-start requires an explicit --usb port')
     app = QApplication.instance() or QApplication(sys.argv[:1])
@@ -1553,8 +1688,11 @@ def main(argv=None):
                 parser.error(f'--{name} outside {widget.minimum()}..{widget.maximum()}')
             widget.setValue(value)
     window.show()
-    if arguments.demo or arguments.usb:
-        window.transport.setCurrentIndex(2 if arguments.demo else 0)
+    if arguments.demo or arguments.usb or arguments.wifi:
+        kind = 'demo' if arguments.demo else 'wifi' if arguments.wifi else 'usb'
+        window.transport.setCurrentIndex(window.transport.findData(kind))
+        if arguments.wifi:
+            window.wifi_host.setEditText(arguments.wifi)
         def connect_when_ready():
             if window.busy: QTimer.singleShot(100,connect_when_ready)
             else:
@@ -1580,7 +1718,7 @@ def main(argv=None):
     if arguments.smoke_test is not None:
         report = window.report()
         (arguments.data_dir/'smoke-report.json').write_text(json.dumps(report,indent=2,ensure_ascii=False)+'\n', encoding='utf-8')
-        if (arguments.demo or arguments.usb) and (report.get('decoded_frames',0)==0 or report.get('error') or report.get('demo_error') or report.get('desktop_cleanup_errors')):
+        if (arguments.demo or arguments.usb or arguments.wifi) and (report.get('decoded_frames',0)==0 or report.get('error') or report.get('demo_error') or report.get('desktop_cleanup_errors')):
             return 1
     return result
 

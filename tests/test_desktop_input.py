@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from hu_lab.desktop_input import DesktopTouchInput
+from hu_lab.desktop_input import DesktopInputArbiter, DesktopTouchInput
 from hu_lab.desktop_session import DesktopConfig, create_client
 from hu_lab.geometry import Rect
 from hu_lab.protocol import ProtocolError
@@ -75,6 +75,29 @@ class DesktopTouchInputTests(unittest.TestCase):
         self.assertEqual([f.action for f in frames],
                          [DOWN, POINTER_DOWN, POINTER_UP, POINTER_DOWN, POINTER_UP, UP])
         self.assertEqual([p.id for p in frames[3].pointers], [1, 0])
+        self.assertFalse(decoder.tracker.active)
+
+    def test_action3_four_independent_contacts_release_and_reuse_without_renumbering(self):
+        client = self.client("action3-multi")
+        control = DesktopTouchInput()
+        g = client.decoder_generation
+        control.contacts(client, [(10, 20, 20), (20, 70, 60), (30, 150, 100), (40, 250, 200)], g)
+        control.contacts(client, [(40, 240, 180), (20, 80, 70), (50, 170, 120)], g)
+        control.finish()
+        frames, decoder = self.decode(client)
+        self.assertEqual([p.id for p in frames[3].pointers], [0, 1, 2, 3])
+        self.assertEqual([p.id for p in frames[6].pointers], [1, 3, 0])
+        self.assertEqual([p.x for p in frames[6].pointers], [80, 240, 170])
+        self.assertFalse(decoder.tracker.active)
+
+    def test_contact_overflow_cancels_supported_pair_without_serializing_extra_pointer(self):
+        client = self.client()
+        control = DesktopTouchInput()
+        control.contacts(client, [(1, 20, 20), (2, 100, 100)], client.decoder_generation)
+        with self.assertRaisesRegex(ProtocolError, "at most 2"):
+            control.contacts(client, [(1, 20, 20), (2, 100, 100), (3, 200, 100)], client.decoder_generation)
+        frames, decoder = self.decode(client)
+        self.assertEqual([frame.action for frame in frames], [DOWN, POINTER_DOWN, CANCEL])
         self.assertFalse(decoder.tracker.active)
 
     def test_lift_uses_qt_final_position_without_creating_an_extra_contact(self):
@@ -216,6 +239,46 @@ class DesktopTouchInputTests(unittest.TestCase):
         self.assertFalse(control.active)
         self.assertFalse(control.scale_pinch(2))
         self.assertEqual(self.decode(client)[0][-1].action, CANCEL)
+
+
+class InputArbiterTests(unittest.TestCase):
+    def test_touchpad_requires_two_then_preserves_last_finger_and_blocks_duplicate_click(self):
+        state = DesktopInputArbiter()
+        self.assertEqual(state.contacts(1, 2, indirect=True), "ignore")
+        self.assertEqual(state.contacts(2, 2, indirect=True), "update")
+        self.assertFalse(state.pointer("down"))
+        self.assertTrue(state.blocks_native_gesture)
+        self.assertEqual(state.contacts(1, 2, indirect=True), "update")
+        self.assertEqual(state.contacts(0, 2, indirect=True), "update")
+        self.assertFalse(state.pointer("move"))
+        self.assertFalse(state.pointer("up"))
+        self.assertTrue(state.pointer("down"))
+        self.assertTrue(state.pointer("up"))
+
+    def test_mouse_drag_owns_input_until_fingers_lift_even_after_mouse_release(self):
+        state = DesktopInputArbiter()
+        self.assertTrue(state.pointer("down"))
+        self.assertEqual(state.contacts(2, 2, indirect=True), "ignore")
+        self.assertTrue(state.pointer("move"))
+        self.assertTrue(state.pointer("up"))
+        self.assertEqual(state.contacts(2, 2, indirect=True), "ignore")
+        self.assertEqual(state.contacts(1, 2, indirect=True), "ignore")
+        self.assertEqual(state.contacts(0, 2, indirect=True), "ignore")
+        self.assertEqual(state.contacts(2, 2, indirect=True), "update")
+
+    def test_overflow_and_focus_cancel_require_empty_contact_snapshot(self):
+        for overflow in (False, True):
+            state = DesktopInputArbiter()
+            self.assertEqual(state.contacts(2, 2, indirect=True), "update")
+            if overflow:
+                self.assertEqual(state.contacts(3, 2, indirect=True), "cancel")
+            else:
+                state.cancel()
+            self.assertEqual(state.contacts(2, 2, indirect=True), "ignore")
+            self.assertTrue(state.blocks_native_gesture)
+            self.assertEqual(state.contacts(0, 2, indirect=True), "ignore")
+            self.assertFalse(state.blocks_native_gesture)
+            self.assertEqual(state.contacts(2, 2, indirect=True), "update")
 
 
 if __name__ == "__main__":

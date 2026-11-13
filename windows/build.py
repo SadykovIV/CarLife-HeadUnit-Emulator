@@ -22,12 +22,12 @@ import urllib.request
 import zipfile
 
 PROJECT = Path(__file__).resolve().parents[1]
-VERSION = "0.4.1"
+VERSION = "0.5.1"
 NAME = f"CarLife-HeadUnit-Emulator-{VERSION}-Windows-x64"
-_release, _, _rc = VERSION.partition("-rc.")
-RELEASE_CHANNEL = "diagnostic-test" if _rc else "stable"
-PE_FLAGS = 0x02 if _rc else 0  # VS_FF_PRERELEASE only for RCs.
-PE_VERSION = ",".join((*_release.split("."), _rc or "0"))
+_release, _, _suffix = VERSION.partition("-")
+RELEASE_CHANNEL = "development" if _suffix.startswith("dev.") else "diagnostic-test" if _suffix else "stable"
+PE_FLAGS = 0x02 if _suffix else 0  # VS_FF_PRERELEASE for local/dev and RC builds.
+PE_VERSION = ",".join((*_release.split("."), _suffix.rsplit(".", 1)[-1] if _suffix else "0"))
 # ctypes resolves these at runtime, so they are not covered by PE import tables.
 REQUIRED_USB_EXPORTS = tuple("libusb_" + name for name in (
     "get_version", "init", "exit", "get_device_list", "free_device_list", "get_session_data",

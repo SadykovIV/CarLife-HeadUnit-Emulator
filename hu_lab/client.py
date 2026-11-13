@@ -323,10 +323,10 @@ class HUClient:
                  transport_factory=None, backend="DEV_STREAM_OVER_ADB",
                  audio_capture=False, audio_capture_limit_mib=8,
                  session_factory=None, on_audio_packet=None, on_frame_available=None):
-        if backend not in ("DEV_STREAM_OVER_ADB", "DIRECT_USB_AOA", "TCP_STREAM"):
+        if backend not in ("DEV_STREAM_OVER_ADB", "DIRECT_USB_AOA", "TCP_STREAM", "TCP6_WIFI"):
             raise ValueError("unsupported transport backend")
-        if (backend == "DIRECT_USB_AOA") != (transport_factory is not None):
-            raise ValueError("native USB requires an explicit transport factory")
+        if (backend in ("DIRECT_USB_AOA", "TCP6_WIFI")) != (transport_factory is not None):
+            raise ValueError("native USB and Wi-Fi require an explicit transport factory")
         if backend == "DEV_STREAM_OVER_ADB" and host not in ("127.0.0.1", "localhost", "::1"):
             raise ValueError("development transport must remain loopback")
         self.backend, self.transport_factory = backend, transport_factory
@@ -515,7 +515,7 @@ class HUClient:
                 first_failure = not self.halt.is_set()
                 if first_failure:
                     origin = getattr(self.sock, "failure_reason", None)
-                    self.error = (origin if isinstance(error, InterruptedError) and origin
+                    self.error = (origin if origin and (isinstance(error, InterruptedError) or self.backend == "TCP6_WIFI")
                                   else f"{type(error).__name__}: {error}")
                     if self.session.state != "BLOCKED_AUTH":
                         self.session.state = "ERROR"
@@ -547,18 +547,26 @@ class HUClient:
             raise ProtocolError("command queue full")
 
     def _writer(self):
-        while not self.halt.is_set():
-            try:
-                packet = self.commands.get(timeout=.2)
-            except queue.Empty:
-                continue
+        next_heartbeat = time.monotonic() + 1.0
+        def write(packet):
             wire = packet.encode()
             with self._pipeline_stage(self.io_stage + "_write"):
                 self.sock.sendall(wire)
             self._progress(self.io_stage + "_write")
             self.trace.wire("tx", wire)
             self.trace.packet("tx", packet)
-            self.commands.task_done()
+        while not self.halt.is_set():
+            try:
+                packet = self.commands.get(timeout=.2)
+            except queue.Empty:
+                packet = None
+            if packet is not None:
+                write(packet)
+                self.commands.task_done()
+            if self.backend == "TCP6_WIFI" and time.monotonic() >= next_heartbeat:
+                if self.session.state in ("STREAMING", "PAUSED") and not self.halt.is_set():
+                    write(Packet(VIDEO, VIDEO_HEARTBEAT))
+                next_heartbeat = time.monotonic() + 1.0
 
     def _reader(self):
         parser = FrameParser()

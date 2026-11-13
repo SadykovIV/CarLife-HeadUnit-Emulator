@@ -527,6 +527,53 @@ class DesktopWindowTests(unittest.TestCase):
         self.assertEqual([fields(p)[1] for msg,p in peer.commands if msg==HU_VERSION], [2])
         self.assertEqual(json.loads(saved_path.read_text())["profile"], "honda-v2")
 
+    def test_wifi_discovery_manual_address_and_separate_persisted_settings(self):
+        from hu_lab.wireless import WirelessPhone
+        window = self.window
+        window.transport.setCurrentIndex(window.transport.findData('wifi'))
+        self.assertTrue(window.wifi_group.isVisible())
+        self.assertTrue(window.wifi_hint.isVisible())
+        self.assertFalse(window.tcp_group.isVisible())
+        self.assertFalse(window.usb_group.isVisible())
+        window.host.setText('127.0.0.2')
+        window.port.setValue(8123)
+        with patch.object(desktop, 'discover_phones', return_value=[WirelessPhone('192.0.2.10', 'CarLife beacon')]):
+            window.refresh_wifi()
+            self.wait_for(lambda: not window.busy)
+        config = window.configuration().validate()
+        self.assertEqual((config.transport, config.host, config.port), ('wifi', '192.0.2.10', 7240))
+        self.assertFalse(config.aoa_start)
+        self.assertIsNone(window.client)  # Discovery never opens a projection session.
+        window.wifi_host.setEditText('192.0.2.11')
+        with patch.object(desktop, 'discover_phones', return_value=[]):
+            window.refresh_wifi()
+            self.wait_for(lambda: not window.busy)
+        self.assertEqual(window.wifi_host.currentText(), '192.0.2.11')
+        window.save_settings()
+        saved = json.loads((Path(self.tmp.name) / 'settings.json').read_text())
+        self.assertEqual((saved['wifi_host'], saved['host'], saved['port']), ('192.0.2.11', '127.0.0.2', 8123))
+        window.wifi_host.setEditText('')
+        window.load_settings()
+        self.assertEqual(window.configuration().host, '192.0.2.11')
+
+    def test_wifi_failure_report_records_channel_without_past_demo(self):
+        from hu_lab.wireless import WirelessConnectionError
+        window = self.window
+        window.transport.setCurrentIndex(window.transport.findData('wifi'))
+        window.wifi_host.setEditText('192.0.2.12')
+        failure = WirelessConnectionError('192.0.2.12', 3, 9240, ConnectionRefusedError('refused'), ['CMD', 'VIDEO'])
+        with patch('hu_lab.wireless.TCP6Stream.connect', side_effect=failure):
+            window.connect_session()
+            self.wait_for(lambda: not window.busy)
+        self.assertIsNone(window.client)
+        self.assertEqual(window.last_report['transport'], 'wifi')
+        self.assertEqual(window.last_report['backend'], 'TCP6_WIFI')
+        self.assertFalse(window.last_report['demo'])
+        detail = window.last_report['connection_failure']
+        self.assertEqual((detail['stage'], detail['channel'], detail['port']), ('wireless_connect', 'MEDIA', 9240))
+        self.assertIn('9240', window.error_label.text())
+        self.assertIsNone(window.last_report['selected_identity'])
+
     def test_decoder_wakes_display_without_periodic_timer_and_disconnect_releases_activity(self):
         window = self.window
         first, peer = self.start_demo()

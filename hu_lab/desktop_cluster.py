@@ -2,10 +2,12 @@
 from html import escape
 import struct
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QImage, QPainter, QPixmap
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt
+from PySide6.QtGui import QImage, QImageReader, QPainter, QPixmap
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QPushButton,
                                QSizePolicy, QVBoxLayout, QWidget)
+
+from .cluster import MAX_ARTWORK_BYTES
 
 
 # CarLife nextTurn values used by Baidu and HeadSwap (AaMeta.T_*).
@@ -42,6 +44,31 @@ def turn_pixmap(blob):
     if image.isNull():
         return None
     return QPixmap.fromImage(image).scaled(44, 44, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+
+def artwork_pixmap(blob):
+    """Decode the raw albumArt field, never a path, URL or arbitrary Qt format."""
+    if not isinstance(blob, bytes) or not 3 <= len(blob) <= MAX_ARTWORK_BYTES:
+        return None
+    if blob.startswith(b'\xff\xd8\xff'):
+        image_format = b'JPEG'  # HeadSwap MetaImages.albumJpeg, 256/160 px.
+    elif blob.startswith(b'\x89PNG\r\n\x1a\n'):
+        image_format = b'PNG'
+    else:
+        return None
+    buffer = QBuffer()
+    buffer.setData(QByteArray(blob))
+    buffer.open(QIODevice.ReadOnly)
+    reader = QImageReader(buffer, image_format)
+    reader.setAutoDetectImageFormat(False)
+    # Check dimensions before decoding, including highly compressed images.
+    size = reader.size()
+    if not (1 <= size.width() <= 1024 and 1 <= size.height() <= 1024):
+        return None
+    image = reader.read()
+    if image.isNull() or image.size() != size:
+        return None
+    return QPixmap.fromImage(image).scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
 
 class _ElidedLabel(QLabel):
@@ -139,15 +166,27 @@ class ClusterPage(QWidget):
         layout.addWidget(nav)
 
         music, box = card('СЕЙЧАС ИГРАЕТ')
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.artwork = QLabel()
+        self.artwork.setObjectName('clusterArtwork')
+        self.artwork.setFixedSize(64, 64)
+        self.artwork.setAlignment(Qt.AlignCenter)
+        self.artwork.setAccessibleName('Обложка альбома')
+        row.addWidget(self.artwork, 0, Qt.AlignVCenter)
+        values = QVBoxLayout()
+        values.setSpacing(4)
         self.song = text_label('—', 'clusterTitle', elide=True)
         self.song.setAccessibleName('Композиция')
-        box.addWidget(self.song)
+        values.addWidget(self.song)
         self.artist = text_label('', 'clusterSecondary', elide=True)
         self.artist.setAccessibleName('Исполнитель')
-        box.addWidget(self.artist)
+        values.addWidget(self.artist)
         self.album = text_label('', 'muted', elide=True)
         self.album.setAccessibleName('Альбом')
-        box.addWidget(self.album)
+        values.addWidget(self.album)
+        row.addLayout(values, 1)
+        box.addLayout(row)
         layout.addWidget(music)
 
         self.demo_button = QPushButton('Запустить демо приборки')
@@ -155,6 +194,7 @@ class ClusterPage(QWidget):
         layout.addWidget(self.demo_button)
         self._rendered = None
         self._icon = None
+        self._artwork = None
         self.refresh(None, demo=False)
 
     def refresh(self, cluster, *, demo):
@@ -194,3 +234,13 @@ class ClusterPage(QWidget):
         self.album.setText(music.get('album') or '')
         self.artist.setVisible(bool(self.artist.text()))
         self.album.setVisible(bool(self.album.text()))
+        artwork = music.get('artwork', b'')
+        if artwork != self._artwork:
+            self._artwork = artwork
+            # A new track without art, an invalid image, STOP and disconnect
+            # all clear the previous cover. Progress updates do not decode it.
+            self.artwork.clear()
+            picture = artwork_pixmap(artwork)
+            if picture is not None:
+                self.artwork.setPixmap(picture)
+            self.artwork.setVisible(picture is not None)

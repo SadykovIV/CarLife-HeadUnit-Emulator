@@ -205,8 +205,8 @@ class DesktopConfig:
     aoa_start: bool = False
 
     def validate(self):
-        if self.transport not in ("tcp", "usb"):
-            raise ValueError("Supported connections are a CarLife TCP stream or an existing USB accessory")
+        if self.transport not in ("tcp", "usb", "wifi"):
+            raise ValueError("Supported connections are native Wi-Fi, a TCP development stream, or USB")
         if type(self.aoa_start) is not bool or (self.aoa_start and self.transport != "usb"):
             raise ValueError("AOA start is an explicit USB-only option")
         if self.profile not in ("v1", "v2", "honda-v2"):
@@ -217,7 +217,7 @@ class DesktopConfig:
         if self.trace_mode not in ("sampled", "full"):
             raise ValueError("Unknown trace mode")
         profile_name(self.touch_profile)
-        if self.transport == "tcp":
+        if self.transport in ("tcp", "wifi"):
             if not isinstance(self.host, str) or not self.host.strip() or any(c.isspace() for c in self.host):
                 raise ValueError("Enter a TCP hostname or IP address, without a URL scheme or spaces")
             if "://" in self.host or "/" in self.host or "\x00" in self.host:
@@ -290,7 +290,7 @@ def create_client(config, output_dir, audio_sink=None, on_decoded_frame=None, on
 
     audio_sink.submit(packet) must be bounded/nonblocking; playback itself runs
     on its owning Qt thread. Changing resolution/profile requires reconnection.
-    TCP is a multiplexed CarLife stream, not the legacy six-socket Wi-Fi mode.
+    Wi-Fi uses native six-socket CarLife; TCP retains the development stream.
     """
     config.validate()
     usb = config.transport == "usb"
@@ -300,8 +300,11 @@ def create_client(config, output_dir, audio_sink=None, on_decoded_frame=None, on
     if usb:
         transport_factory = (ExplicitAOATransportFactory(config.usb_identity, output_dir) if config.aoa_start
                              else AccessoryTransportFactory(config.usb_identity))
+    elif config.transport == "wifi":
+        from .wireless import TCP6Stream
+        transport_factory = lambda: TCP6Stream.connect(config.host)
     return client_type(config.host, config.port, output_dir, config.width, config.height, config.fps,
-                       backend="DIRECT_USB_AOA" if usb else "TCP_STREAM",
+                       backend="DIRECT_USB_AOA" if usb else "TCP6_WIFI" if config.transport == "wifi" else "TCP_STREAM",
                        transport_factory=transport_factory,
                        session_factory=DesktopV2Session if v2 else DesktopV1Session,
                        touch_profile=config.touch_profile, trace_mode=config.trace_mode,

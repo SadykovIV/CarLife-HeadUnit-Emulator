@@ -27,6 +27,7 @@ except ImportError:
     desktop = None
 
 from hu_lab.macos_activity import UserInitiatedActivity
+from hu_lab.macos_touch import TrackpadSnapshot
 from hu_lab.protocol import FrameParser, Packet, TOUCH, TOUCH_ACTION
 from hu_lab.touch import ACTION3, CANCEL, DOWN, MOVE, POINTER_DOWN, POINTER_UP, UP, TouchDecoder
 
@@ -187,6 +188,111 @@ class DesktopInputWindowTests(unittest.TestCase):
         self.assertEqual((frames[-1].pointers[0].x, frames[-1].pointers[0].y), (240, 140))
         self.assertFalse(decoder.tracker.active)
 
+    def test_indirect_contacts_start_at_two_and_mouse_click_cannot_replace_them(self):
+        client, peer = self.start_demo()
+        surface = self.window.video
+        device = QTest.createTouchDevice(QInputDevice.DeviceType.TouchPad)
+        sequence = QTest.touchEvent(surface, device, False)
+        sequence.press(0, self.point(80, 90), surface).commit()
+        self.app.processEvents()
+        self.assertFalse(client.pending_touch)
+        sequence.stationary(0).press(1, self.point(220, 160), surface).commit()
+        self.wait_for(lambda: len(surface.touch_input.pointers) == 2)
+        QTest.mousePress(surface, Qt.LeftButton, pos=self.point())
+        QTest.mouseMove(surface, self.point(170, 130))
+        QTest.mouseRelease(surface, Qt.LeftButton, pos=self.point(170, 130))
+        self.assertEqual(len(surface.touch_input.pointers), 2)
+        # Translation and rotation use independent coordinates, not a pair
+        # constrained symmetrically around the cursor like synthetic zoom.
+        sequence.move(0, self.point(100, 140), surface).move(1, self.point(240, 120), surface).commit()
+        self.app.processEvents()
+        sequence.release(0, self.point(110, 145), surface).stationary(1).commit()
+        self.app.processEvents()
+        self.assertEqual(len(surface.touch_input.pointers), 1)
+        sequence.move(1, self.point(250, 110), surface).commit()
+        sequence.release(1, self.point(255, 105), surface).commit()
+        self.wait_for(lambda: len(self.frames(client, peer)[0]) == 6)
+        frames, decoder = self.frames(client, peer)
+        self.assertEqual([f.action for f in frames], [DOWN, POINTER_DOWN, MOVE, POINTER_UP, MOVE, UP])
+        self.assertEqual([(p.x, p.y) for p in frames[2].pointers], [(100, 140), (240, 120)])
+        self.assertFalse(decoder.tracker.active)
+
+    def test_mouse_drag_does_not_become_multitouch_when_fingers_move(self):
+        client, peer = self.start_demo()
+        surface = self.window.video
+        device = QTest.createTouchDevice(QInputDevice.DeviceType.TouchPad)
+        sequence = QTest.touchEvent(surface, device, False)
+        QTest.mousePress(surface, Qt.LeftButton, pos=self.point(100, 100))
+        sequence.press(0, self.point(80, 90), surface).press(1, self.point(220, 160), surface).commit()
+        QTest.mouseMove(surface, self.point(110, 110))
+        QTest.mouseRelease(surface, Qt.LeftButton, pos=self.point(120, 120))
+        sequence.move(0, self.point(90, 100), surface).stationary(1).commit()
+        sequence.release(0, self.point(90, 100), surface).release(1, self.point(220, 160), surface).commit()
+        self.wait_for(lambda: len(self.frames(client, peer)[0]) >= 3)
+        frames, _ = self.frames(client, peer)
+        self.assertEqual([f.action for f in frames], [DOWN, MOVE, UP])
+        self.assertFalse(client.pending_touch)
+
+    def test_touch_overflow_waits_for_release_and_suppresses_native_zoom_duplicate(self):
+        client, peer = self.start_demo()
+        surface = self.window.video
+        device = QTest.createTouchDevice(QInputDevice.DeviceType.TouchPad)
+        sequence = QTest.touchEvent(surface, device, False)
+        sequence.press(0, self.point(80, 90), surface).press(1, self.point(220, 160), surface).commit()
+        self.wait_for(lambda: surface.touch_input.active)
+        position = QPointF(self.point())
+        def zoom():
+            event = QNativeGestureEvent(Qt.NativeGestureType.ZoomNativeGesture, device, 2,
+                position, position, QPointF(surface.mapToGlobal(self.point())), .2, QPointF())
+            QApplication.sendEvent(surface, event)
+        zoom()
+        self.assertEqual(surface.input_source, 'qt_trackpad')
+        sequence.stationary(0).stationary(1).press(2, self.point(180, 100), surface).commit()
+        self.app.processEvents()
+        self.assertFalse(client.pending_touch)
+        sequence.stationary(0).stationary(1).release(2, self.point(180, 100), surface).commit()
+        zoom()
+        self.assertFalse(client.pending_touch)
+        sequence.release(0, self.point(80, 90), surface).release(1, self.point(220, 160), surface).commit()
+        self.wait_for(lambda: len(self.frames(client, peer)[0]) >= 3)
+        self.assertEqual([f.action for f in self.frames(client, peer)[0]], [DOWN, POINTER_DOWN, CANCEL])
+        sequence.press(0, self.point(80, 90), surface).press(1, self.point(220, 160), surface).commit()
+        self.wait_for(lambda: surface.touch_input.active)
+        sequence.release(0, self.point(80, 90), surface).release(1, self.point(220, 160), surface).commit()
+        self.wait_for(lambda: len(self.frames(client, peer)[0]) == 7)
+        self.assertFalse(self.frames(client, peer)[1].tracker.active)
+
+    def test_native_pad_coordinates_span_visible_video_and_follow_rotation(self):
+        client, peer = self.start_demo()
+        surface = self.window.video
+        device = QTest.createTouchDevice(QInputDevice.DeviceType.TouchPad)
+        for rotation in (0, 90, 180, 270):
+            self.window.rotation.setCurrentIndex(self.window.rotation.findData(rotation))
+            self.app.processEvents()
+            self.wait_for(lambda: surface.transform is not None)
+            sequence = QTest.touchEvent(surface, device, False)
+            with patch.object(desktop.QApplication, 'platformName', return_value='cocoa'), \
+                 patch.object(surface.trackpad, 'read', return_value=TrackpadSnapshot(
+                     ((100, .2, .25), (200, .8, .75)))) as native:
+                sequence.press(0, self.point(), surface).press(1, self.point(170, 120), surface).commit()
+                self.app.processEvents()
+                self.assertTrue(native.called)
+                self.assertEqual(surface.input_source, 'trackpad')
+                points = surface.touch_input.pointers
+                self.assertEqual(len(points), 2)
+                a, b = [surface.transform.video_to_view(p.x, p.y) for p in points]
+                self.assertLess(a[0], b[0])
+                self.assertLess(a[1], b[1])
+                # The Qt test points above are only 10 video pixels apart.
+                # Actual native normalized fingers must span most of the image.
+                self.assertGreater(abs(a[0] - b[0]), surface.transform.rectangle.width * .5)
+                native.return_value = TrackpadSnapshot((), ((100, .2, .25), (200, .8, .75)))
+                sequence.release(0, self.point(), surface).release(1, self.point(170, 120), surface).commit()
+                self.app.processEvents()
+                self.assertFalse(client.pending_touch)
+        self.wait_for(lambda: len(self.frames(client, peer)[0]) == 16)
+        self.assertFalse(self.frames(client, peer)[1].tracker.active)
+
     def test_touch_cancel_does_not_restart_on_late_update(self):
         client, peer = self.start_demo()
         surface = self.window.video
@@ -203,6 +309,21 @@ class DesktopInputWindowTests(unittest.TestCase):
         frames, decoder = self.frames(client, peer)
         self.assertEqual([f.action for f in frames], [DOWN, POINTER_DOWN, CANCEL])
         self.assertFalse(decoder.tracker.active)
+
+    def test_window_deactivation_cancels_contacts_and_late_fingers_cannot_restart(self):
+        client, peer = self.start_demo()
+        surface = self.window.video
+        device = QTest.createTouchDevice(QInputDevice.DeviceType.TouchPad)
+        sequence = QTest.touchEvent(surface, device, False)
+        sequence.press(0, self.point(80, 90), surface).press(1, self.point(220, 160), surface).commit()
+        self.wait_for(lambda: surface.touch_input.active)
+        QApplication.sendEvent(surface, QEvent(QEvent.WindowDeactivate))
+        self.assertFalse(client.pending_touch)
+        sequence.move(0, self.point(90, 100), surface).stationary(1).commit()
+        self.assertFalse(client.pending_touch)
+        sequence.release(0, self.point(90, 100), surface).release(1, self.point(220, 160), surface).commit()
+        self.wait_for(lambda: len(self.frames(client, peer)[0]) == 3)
+        self.assertEqual([f.action for f in self.frames(client, peer)[0]], [DOWN, POINTER_DOWN, CANCEL])
 
     def test_tab_pause_and_disconnect_release_active_gestures(self):
         client, peer = self.start_demo()
