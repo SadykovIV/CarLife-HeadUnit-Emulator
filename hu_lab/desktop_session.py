@@ -10,16 +10,18 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 
 from .client import HUClient
 from .cluster import DesktopClusterSession
 from .honda_reference import HondaReferenceSession
 from .honda_reference_client import HondaReferenceClient
-from .native_usb import ACCESSORY_IDS, USBStream
+from .native_usb import (ACCESSORY_IDS, USBStream, _require_active, acquire_usb_port,
+                         claim_accessory_when_available, wait_for_port_lock)
 from .protocol import (HUSession, Packet, ProtocolError, TOUCH, HARD_KEY, protobuf)
 from .touch import profile_name
 from .usb import LibUSB, USBIdentity, acquisition_stage, open_for_acquisition, select_exact, select_bulk_pair
-from .platform_support import bundled_libusb, lock_owner, open_owner_lock, usb_lock_directory
+from .platform_support import bundled_libusb, open_owner_lock, usb_lock_directory
 
 
 class DesktopConnectionError(RuntimeError):
@@ -111,23 +113,27 @@ class _AccessoryClaimAdmission:
 
 class AccessoryTransportFactory:
     """Acquire only the exact selected accessory, sharing the existing HU lock."""
-    def __init__(self, identity, *, usb_factory=None, lock_directory=None):
+    def __init__(self, identity, *, usb_factory=None, lock_directory=None, on_claim_wait=None, cancel=None):
         self.identity = _identity(identity)
         _require_accessory_identity(self.identity)
         self.usb_factory = usb_factory or _desktop_usb_factory
         self.lock_directory = Path(lock_directory) if lock_directory is not None else usb_lock_directory()
+        self.cancel = cancel if cancel is not None else threading.Event()
+        self.on_claim_wait = on_claim_wait
 
     def __call__(self):
+        _require_active(self.cancel)
         identity = self.identity
         key = identity.physical_key.replace(":", "-")
         owner = None
         usb = handle = None
         try:
             owner = open_owner_lock(self.lock_directory / f"carlife-usb-{key}.lock")
-            try:
-                lock_owner(owner)
-            except BlockingIOError as error:
-                raise DesktopConnectionError("Another CarLife session already owns this USB port; disconnect it first") from error
+            with acquisition_stage("usb_port_lock", identity):
+                try:
+                    wait_for_port_lock(owner, self.cancel, self.on_claim_wait)
+                except BlockingIOError as error:
+                    raise DesktopConnectionError("Another CarLife session already owns this USB port; disconnect it first") from error
             usb = self.usb_factory()
             try:
                 selected = select_exact(usb.discover(), identity)
@@ -138,7 +144,8 @@ class AccessoryTransportFactory:
             # Revalidate the second enumeration made by open_exact before claim.
             _validate_descriptor(handle.descriptor, identity)
             with acquisition_stage("accessory_claim", identity, attempted_identity=identity):
-                handle.claim_accessory(_AccessoryClaimAdmission(identity))
+                claim_accessory_when_available(handle, _AccessoryClaimAdmission(identity), self.cancel, self.on_claim_wait)
+                _require_active(self.cancel)
             owner.seek(0)
             owner.truncate()
             owner.write(json.dumps({"pid": os.getpid(), "physical_key": identity.physical_key,
@@ -171,19 +178,29 @@ class ExplicitAOATransportFactory:
     chosen enumeration and actual serial, and NativeUSBTransportFactory records
     its single AOA START intent before sending any mode-changing request.
     """
-    def __init__(self, identity, output_dir, *, usb_factory=None):
+    def __init__(self, identity, output_dir, *, usb_factory=None, on_claim_wait=None, cancel=None):
         self.identity = _identity(identity)
         _require_physical_identity(self.identity)
         self.output_dir = Path(output_dir)
         self.usb_factory = usb_factory or _desktop_usb_factory
         self.prepared = None
+        self.cancel = cancel if cancel is not None else threading.Event()
+        self.on_claim_wait = on_claim_wait
 
     def __call__(self):
-        if self.prepared is None:
-            from .public import prepare_usb
-            self.prepared = prepare_usb(self.identity.physical_key, self.output_dir,
-                aoa_start=True, usb_factory=self.usb_factory, expected_identity=self.identity)
-        return self.prepared()
+        # On Windows even reading the serial can require opening WinUSB.
+        # Serialize preflight, native open and streaming under the same lock.
+        owner = acquire_usb_port(self.identity, self.cancel, self.on_claim_wait)
+        try:
+            if self.prepared is None:
+                from .public import prepare_usb
+                self.prepared = prepare_usb(self.identity.physical_key, self.output_dir,
+                    aoa_start=True, usb_factory=self.usb_factory, expected_identity=self.identity,
+                    on_claim_wait=self.on_claim_wait, cancel=self.cancel)
+        except BaseException:
+            owner.close()
+            raise
+        return self.prepared(acquired_port=owner)
 
 
 @dataclass(frozen=True)
@@ -285,7 +302,8 @@ class DesktopV2Client(_DesktopControls, HondaReferenceClient):
     pass
 
 
-def create_client(config, output_dir, audio_sink=None, on_decoded_frame=None, on_frame_available=None):
+def create_client(config, output_dir, audio_sink=None, on_decoded_frame=None, on_frame_available=None, *,
+                  on_claim_wait=None, cancel=None):
     """Construct (do not connect) a normal HUClient for the desktop worker.
 
     audio_sink.submit(packet) must be bounded/nonblocking; playback itself runs
@@ -298,8 +316,12 @@ def create_client(config, output_dir, audio_sink=None, on_decoded_frame=None, on
     client_type = DesktopV2Client if v2 else DesktopClient
     transport_factory = None
     if usb:
-        transport_factory = (ExplicitAOATransportFactory(config.usb_identity, output_dir) if config.aoa_start
-                             else AccessoryTransportFactory(config.usb_identity))
+        if config.aoa_start:
+            transport_factory = ExplicitAOATransportFactory(config.usb_identity, output_dir,
+                                                            on_claim_wait=on_claim_wait, cancel=cancel)
+        else:
+            transport_factory = AccessoryTransportFactory(config.usb_identity, on_claim_wait=on_claim_wait,
+                                                          cancel=cancel)
     elif config.transport == "wifi":
         from .wireless import TCP6Stream
         transport_factory = lambda: TCP6Stream.connect(config.host)

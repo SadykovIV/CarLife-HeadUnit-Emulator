@@ -166,6 +166,7 @@ class NativeUSBTests(unittest.TestCase):
         self.assertTrue(stream.handle.cancel.is_set())
         self.assertFalse(stream.first_write_complete)
         self.assertEqual(events[-1]["stage"], "usb_first_write_failed")
+        self.assertTrue(stream.evidence['first_handshake_write_timeout'])
         self.assertFalse(events[-1]["replay"])
 
     def test_version_reaches_reader_that_discards_a_transfer_tail_after_header(self):

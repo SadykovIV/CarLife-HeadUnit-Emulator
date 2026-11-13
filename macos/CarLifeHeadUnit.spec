@@ -78,7 +78,7 @@ app = BUNDLE(
     info_plist={
         "CFBundleDisplayName": "CarLife HeadUnit Emulator",
         "CFBundleShortVersionString": "0.5.1",
-        "CFBundleVersion": "9",
+        "CFBundleVersion": "11",
         "CarLifeVersion": "0.5.1",
         "LSMinimumSystemVersion": minimum_macos,
         "LSApplicationCategoryType": "public.app-category.developer-tools",

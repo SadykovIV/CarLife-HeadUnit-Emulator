@@ -167,10 +167,12 @@ class DesktopUSBTests(unittest.TestCase):
     def test_explicit_aoa_factory_prepares_only_on_connect_and_reuses_admission(self):
         normal = replace(self.identity, pid=0x4EE1)
         with patch("hu_lab.public.prepare_usb") as prepare:
+            # The real native factory transfers this lock to its stream.
+            prepare.return_value.side_effect = lambda *, acquired_port: acquired_port.close() or "stream"
             factory = ExplicitAOATransportFactory(normal, self.tmp.name)
             prepare.assert_not_called()
             stream = factory()
-            self.assertIs(stream, prepare.return_value.return_value)
+            self.assertEqual(stream, "stream")
             factory()
             prepare.assert_called_once()
             self.assertTrue(prepare.call_args.kwargs["aoa_start"])

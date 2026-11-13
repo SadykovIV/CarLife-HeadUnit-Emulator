@@ -1,11 +1,13 @@
 # Changelog
 
-## [0.5.1](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/tag/v0.5.1) — 2026-11-13
+## [0.5.1](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/tag/v0.5.1) — 2026-11-13, updated 2026-11-14
 
 - Connect to a compatible phone over Wi-Fi. Put both devices on the same network or use the phone hotspot, then discover the phone or enter its IP address.
 - Move, zoom and rotate maps with independent contacts on a Mac trackpad or a touchscreen. Legacy dual supports two fingers. Compatible devices can use up to four with Action3.
 - Show received JPEG or PNG album covers beside the track title and artist in the instrument cluster. Switching to a track without artwork clears the previous cover.
 - Keep music and voice prompts playing while the window processes gestures or redraws the projection.
+- Reconnect to a phone already in CarLife accessory mode when its USB address changes. The emulator verifies the previously selected phone by port and serial number before claiming it.
+- Wait up to a minute for another emulator window to release the selected USB port. On macOS, show the application holding the CarLife interface when the system identifies it, and continue once the interface is free. If the phone is still in an Android Auto session, the connection message explains how to switch back to CarLife.
 
 ## [0.4.1](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/tag/v0.4.1) — 2026-11-06
 

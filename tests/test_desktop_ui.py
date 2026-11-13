@@ -101,6 +101,27 @@ class DesktopWindowTests(unittest.TestCase):
                   f"client_error={client.error if client else None}; "
                   f"ui_error={self.window.error_label.text()}")
 
+    def test_owner_wait_displays_app_and_cancel_releases_connection_worker(self):
+        window = self.window
+        window.transport.setCurrentIndex(window.transport.findData('usb'))
+        window.usb_devices.clear()
+        window.usb_devices.addItem('USB', dict(bus=1, ports=[2], vid=0x18d1, pid=0x2d01, address=2))
+        def held(*args, on_claim_wait, cancel, **kwargs):
+            on_claim_wait('pid 123, livi-helperd')
+            if not cancel.wait(4):
+                raise RuntimeError('Cancellation did not reach the USB worker')
+            raise InterruptedError('USB connection cancelled')
+        with patch.object(desktop, 'create_client', side_effect=held):
+            window.connect_session()
+            self.wait_for(lambda: 'Завершите LIVI' in window.error_label.text())
+            self.assertEqual(window.disconnect_button.text(), 'Отменить')
+            window.disconnect_button.click()
+            self.wait_for(lambda: not window.busy)
+        self.assertIsNone(window.client)
+        self.assertTrue(window.connect_button.isEnabled())
+        self.assertEqual(window.last_report['connection_failure']['reason'], 'cancelled')
+        self.assertTrue(window.error_label.isHidden())
+
     def start_demo(self):
         QTest.mouseClick(self.window.connect_button, Qt.LeftButton)
         self.wait_for(lambda: self.window.client is not None and
@@ -176,6 +197,25 @@ class DesktopWindowTests(unittest.TestCase):
             self.assertEqual((config.usb_identity.vid, config.usb_identity.pid,
                               config.usb_identity.address), (0x18d1, 0x2d00, 9))
             create.assert_not_called()
+
+    def test_usb_refresh_preserves_verified_serial_for_reconnect_until_operator_reselects(self):
+        window = self.window
+        window.transport.setCurrentIndex(window.transport.findData("usb"))
+        selected = dict(bus=1, ports=[2], vid=0x18d1, pid=0x2d01, address=1)
+        window.usb_devices.clear()
+        window.usb_devices.addItem("Verified phone", dict(selected, serial_sha256="b" * 64))
+        self.discover.return_value = []
+        window.refresh_usb()
+        self.wait_for(lambda: not window.busy and not window.pending)
+        self.assertIsNone(window.usb_devices.currentData())
+        self.discover.return_value = [dict(identity=dict(selected, address=2),
+                                           label="AOA", desktop_supported=True)]
+        window.refresh_usb()
+        self.wait_for(lambda: not window.busy and not window.pending)
+        pinned = window.configuration().usb_identity
+        self.assertEqual((pinned.address, pinned.serial_sha256), (2, "b" * 64))
+        window.usb_devices.activated.emit(window.usb_devices.currentIndex())
+        self.assertEqual(window.configuration().usb_identity.serial_sha256, "")
 
     def test_usb_refresh_missing_selected_port_never_selects_another_accessory(self):
         window = self.window

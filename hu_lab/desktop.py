@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 
-from PySide6.QtCore import Qt, QEvent, QPointF, QRectF, QTimer, QUrl
+from PySide6.QtCore import Qt, QEvent, QPointF, QRectF, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QImage, QEventPoint, QInputDevice, QKeySequence, QPainter, QPalette, QPixmap, QTransform
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
@@ -49,6 +49,14 @@ def _usb_label(identity):
     return f"{identity['vid']:04x}:{identity['pid']:04x} (порт {identity['bus']}:{ports}, адрес {identity['address']})"
 
 
+def _owner_hint(owner):
+    if owner == 'CarLife HeadUnit Emulator':
+        return 'Порт USB занят другим сеансом CarLife HeadUnit Emulator. Нажмите «Отключить» в его окне.'
+    if owner.rsplit(', ', 1)[-1] == 'livi-helperd':
+        return 'Интерфейс CarLife занят LIVI (livi-helperd). Завершите LIVI через ⌘Q.'
+    return f'Интерфейс CarLife занят: {owner}. Освободите USB-подключение в этом приложении.'
+
+
 class _ConnectionAttemptFailed(Exception):
     """Carry the failed attempt's own report from the connection worker to Qt."""
     def __init__(self, report):
@@ -57,7 +65,14 @@ class _ConnectionAttemptFailed(Exception):
         stage = detail['stage']
         message = report['error']
         issue = detail.get('selection_reason')
-        if issue == 'adb_only':
+        if detail.get('claim_owner'):
+            message = _owner_hint(detail['claim_owner']) + ' Затем нажмите «Подключить».'
+        elif report['platform'] == 'darwin' and stage == 'accessory_claim' and detail.get('code') in (-3, -6):
+            message = ('macOS не дала доступ к интерфейсу CarLife. Проверьте доступ к USB-аксессуарам '
+                       'и закройте другие программы проекции, затем нажмите «Подключить».')
+        elif detail.get('reason') == 'cancelled':
+            message = 'Подключение отменено.'
+        elif issue == 'adb_only':
             message = ('Через WinUSB доступен только ADB. Для CarLife нужен отдельный '
                        'интерфейс аксессуара 0 с драйвером WinUSB.')
         elif issue in ('no_winusb', 'no_verified_accessory'):
@@ -494,6 +509,8 @@ class VideoSurface(QWidget):
 
 
 class HeadUnitWindow(QMainWindow):
+    claim_waiting = Signal(object, str)
+
     def __init__(self, data_dir):
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -508,6 +525,8 @@ class HeadUnitWindow(QMainWindow):
         self.last_report = None
         self.history = []
         self.busy = False
+        self.usb_connect_cancel = None
+        self.claim_waiting.connect(self.show_claim_wait)
         self.closing = False
         self.last_state = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='headunit-control')
@@ -559,6 +578,7 @@ class HeadUnitWindow(QMainWindow):
         self.usb_devices.setMinimumWidth(240)
         self.usb_devices.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.usb_devices.setToolTip('Устройство CarLife. При подключении режим AOA включается автоматически.')
+        self.usb_devices.activated.connect(self.usb_selection_activated)
         usb_bar.addWidget(self.usb_devices, 1)
         self.scan_button = button('↻', self.refresh_usb)
         self.scan_button.setFixedWidth(38)
@@ -621,6 +641,7 @@ class HeadUnitWindow(QMainWindow):
         navigation.addWidget(self.header_volume_label)
         layout.addLayout(navigation)
         self.error_label = label('', 'error', True)
+        self.error_label.setTextFormat(Qt.PlainText)
         self.error_label.hide()
         layout.addWidget(self.error_label)
 
@@ -998,6 +1019,14 @@ class HeadUnitWindow(QMainWindow):
         self.error_label.setText(text); self.error_label.show()
         self.log_event('Ошибка: ' + text)
 
+    def show_claim_wait(self, attempt, owner):
+        if attempt is self.usb_connect_cancel and not attempt.is_set():
+            message = _owner_hint(owner) + ' Ожидаю освобождения интерфейса…'
+            self.error_label.setText(message)
+            self.error_label.show()
+            self.state.setText('●  Ожидание USB')
+            self.log_event(message)
+
     def invoke(self, fn, quiet=False):
         try:
             fn()
@@ -1110,6 +1139,13 @@ class HeadUnitWindow(QMainWindow):
             self.video.transform = None
             self.video.update()
 
+    def usb_selection_activated(self, index):
+        # A deliberate picker selection can adopt a replacement phone on the
+        # same port. Automatic list refreshes must keep the verified serial.
+        item = self.usb_devices.itemData(index)
+        if item and item.get('serial_sha256'):
+            self.usb_devices.setItemData(index, dict(item, serial_sha256=''))
+
     def refresh_usb(self):
         if self.busy or self.client: return
         def done(devices):
@@ -1131,6 +1167,8 @@ class HeadUnitWindow(QMainWindow):
                     if item and (item == previous or (previous.get('ports') and
                             (item.get('bus'), tuple(item.get('ports', ()))) ==
                             (previous.get('bus'), tuple(previous['ports'])))):
+                        if previous.get('serial_sha256'):
+                            self.usb_devices.setItemData(n, dict(item, serial_sha256=previous['serial_sha256']))
                         self.usb_devices.setCurrentIndex(n)
                         matched = True
                         break
@@ -1225,6 +1263,8 @@ class HeadUnitWindow(QMainWindow):
                        backend='DIRECT_USB_AOA' if kind == 'usb' else 'TCP6_WIFI' if kind == 'wifi' else 'TCP_STREAM',
                        selected_identity=selected, decoded_frames=0)
         self.last_report = attempt
+        cancel = threading.Event() if kind == 'usb' and configuration_error is None else None
+        self.usb_connect_cancel = cancel
         self.log_event('Подключение…')
         self.state.setText('●  Подключение…')
         def work():
@@ -1241,8 +1281,11 @@ class HeadUnitWindow(QMainWindow):
                     peer = DemoPeer(tone=tone, touch_profile=config.touch_profile)
                     local_config = replace(config, host='127.0.0.1',port=peer.port)
                 else: local_config = config
+                claim_options = {}
+                if cancel is not None:
+                    claim_options.update(cancel=cancel, on_claim_wait=lambda owner: self.claim_waiting.emit(cancel, owner))
                 client = create_client(local_config, output, audio_sink=ingress,
-                                       on_frame_available=self.frame_wake.notify)
+                                       on_frame_available=self.frame_wake.notify, **claim_options)
                 stage = 'start_client'
                 client.start()
                 stage = 'start_keyboard'
@@ -1254,6 +1297,8 @@ class HeadUnitWindow(QMainWindow):
                 return client, peer, keyboard
             except Exception as error:
                 detail = dict(getattr(error, 'connection_failure', None) or {})
+                if isinstance(error, InterruptedError) and cancel and cancel.is_set():
+                    detail['reason'] = 'cancelled'
                 detail.setdefault('stage', stage)
                 detail.setdefault('selected_identity', selected)
                 detail.setdefault('attempted_identity', None)
@@ -1299,6 +1344,8 @@ class HeadUnitWindow(QMainWindow):
                 clean('Report', save_failure)
                 raise _ConnectionAttemptFailed(report) from error
         def done(result):
+            self.usb_connect_cancel = None
+            self.error_label.hide()
             self.client, self.demo, self.keyboard = result
             self.keyboard_start_future = None
             self.keyboard_start_requested = False
@@ -1320,8 +1367,9 @@ class HeadUnitWindow(QMainWindow):
             self.notice.setText(('ДЕМО • локальный H.264 + PCM, синтетический MD' if demo_mode else
                 f'{config.transport.upper()} • {config.profile} • {config.width} × {config.height} / {config.fps} fps') + ' • мышь управляет экраном')
             self.log_event(f'Сессия: {output.name}')
-            if self.closing: self.disconnect_session()
+            if self.closing or (cancel and cancel.is_set()): self.disconnect_session()
         def failed(error):
+            self.usb_connect_cancel = None
             if isinstance(error, _ConnectionAttemptFailed):
                 report = self.last_report = error.report
                 self.history.append({'session_id':report['session_id'], 'error':report['error'], 'demo':report['demo']})
@@ -1339,7 +1387,10 @@ class HeadUnitWindow(QMainWindow):
                 for issue in report['desktop_cleanup_errors']:
                     self.log_event('Завершение попытки: ' + issue)
                 self.ingress = None
-            if config is not None and kind == 'usb' and not self.closing:
+                if detail.get('reason') == 'cancelled':
+                    self.error_label.hide()
+                    self.state.setText('●  Отключено')
+            if config is not None and kind == 'usb' and not self.closing and not cancel.is_set():
                 self.refresh_usb()
         self.submit(work,done,on_error=failed)
 
@@ -1360,6 +1411,11 @@ class HeadUnitWindow(QMainWindow):
 
     def disconnect_session(self, after=None):
         if isinstance(after,bool): after = None
+        if self.usb_connect_cancel is not None and self.busy:
+            self.usb_connect_cancel.set()
+            self.state.setText('●  Отмена подключения…')
+            self.refresh_buttons()
+            return
         if self.busy: return
         if not self.client:
             if after: after()
@@ -1423,7 +1479,14 @@ class HeadUnitWindow(QMainWindow):
             self.state.setText('●  Отключено')
             self.stats.setText('Подключите устройство в верхней панели')
             self.log_event(f'Отключено. Кадров: {report["decoded_frames"]}; отчёт сохранён.')
-            if report['error']: self.show_error(report['error'])
+            if report['error']:
+                usb = report.get('transport') or {}
+                if isinstance(usb, dict) and usb.get('first_handshake_write_timeout') and usb.get('entry') == 'ALREADY_ACCESSORY':
+                    self.show_error('Интерфейс USB открыт, но телефон не принял первый пакет CarLife. '
+                                    'Откройте HeadSwap. Если до этого работал Android Auto, закройте его приложение '
+                                    'на компьютере, один раз переподключите кабель и нажмите «Подключить».')
+                else:
+                    self.show_error(report['error'])
             if report.get('desktop_cleanup_errors'):
                 self.show_error('; '.join(report['desktop_cleanup_errors']))
             if after: after()
@@ -1496,7 +1559,9 @@ class HeadUnitWindow(QMainWindow):
         connected = self.client is not None
         streaming = connected and self.client.session.state == 'STREAMING' and not self.busy
         self.connect_button.setEnabled(not connected and not self.busy)
-        self.disconnect_button.setEnabled(connected and not self.busy)
+        cancel = self.usb_connect_cancel
+        self.disconnect_button.setText('Отменить' if cancel else 'Отключить')
+        self.disconnect_button.setEnabled((connected and not self.busy) or bool(cancel and not cancel.is_set()))
         self.reconnect_button.setEnabled(not self.busy)
         self.apply_button.setEnabled(not self.busy)
         self.scan_button.setEnabled(not connected and not self.busy)
@@ -1633,6 +1698,8 @@ class HeadUnitWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.closing = True
+        if self.usb_connect_cancel is not None:
+            self.usb_connect_cancel.set()
         if self.busy or self.client:
             event.ignore()
             if not self.busy: self.disconnect_session()

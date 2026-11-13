@@ -5,7 +5,7 @@ import hashlib
 import json
 import time
 
-from .native_usb import ACCESSORY_IDS, NativeUSBTransportFactory
+from .native_usb import ACCESSORY_IDS, NativeUSBTransportFactory, _require_active
 from .usb import (LibUSB, RecoveryBlocked, USBEnumerationChanged, USBIdentity,
                   acquisition_stage, open_for_acquisition)
 
@@ -34,10 +34,12 @@ def select_port(devices, physical_key):
     return matches[0]
 
 
-def prepare_usb(physical_key, output, *, aoa_start=False, usb_factory=LibUSB, expected_identity=None):
+def prepare_usb(physical_key, output, *, aoa_start=False, usb_factory=LibUSB, expected_identity=None,
+                on_claim_wait=None, cancel=None):
     """Read the selected serial, then create a factory; no AOA request/claim here."""
     output = Path(output)
     with acquisition_stage('preflight_discovery', expected_identity):
+        _require_active(cancel)
         context = usb_factory()
     with context as usb:
         with acquisition_stage('preflight_discovery', expected_identity):
@@ -46,17 +48,21 @@ def prepare_usb(physical_key, output, *, aoa_start=False, usb_factory=LibUSB, ex
             selected = select_port(devices, physical_key)
             identity = USBIdentity(**{**selected["identity"], "ports": tuple(selected["identity"]["ports"])})
             picker = expected_identity or identity
-            _require_selected_enumeration(identity, picker)
+            # A previous connection verified this accessory's serial. Its
+            # address may have changed since the picker enumerated the port.
+            # Only read the serial at the new address until it matches.
+            known_accessory = bool(picker.serial_sha256 and (picker.vid, picker.pid) in ACCESSORY_IDS)
+            _require_selected_enumeration(identity, picker, allow_new_address=known_accessory)
         stage = ("preflight_accessory_open" if (picker.vid, picker.pid) in ACCESSORY_IDS
                  else "preflight_normal_open")
         with open_for_acquisition(usb, identity, selected_identity=picker, stage=stage) as handle:
             opened = USBIdentity(**{**handle.descriptor["identity"],
                                    "ports": tuple(handle.descriptor["identity"]["ports"])})
             with acquisition_stage(stage, picker, attempted_identity=opened):
-                _require_selected_enumeration(opened, picker)
+                _require_selected_enumeration(opened, identity)
                 serial_hash = handle.serial_sha256()
                 if picker.serial_sha256 and serial_hash != picker.serial_sha256:
-                    raise RecoveryBlocked("Selected USB device serial changed; refresh and select it again")
+                    raise USBEnumerationChanged("Selected USB device serial changed; refresh and select it again", opened)
     identity = USBIdentity(**{**asdict(identity), "serial_sha256": serial_hash})
     output.mkdir(parents=True, exist_ok=True)
     path = output / "usb-selection.json"
@@ -70,11 +76,12 @@ def prepare_usb(physical_key, output, *, aoa_start=False, usb_factory=LibUSB, ex
     admission = OperatorUSBAdmission(identity, {"path": str(path.resolve()),
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
     return NativeUSBTransportFactory(identity, admission, output,
-                                     allow_aoa_start=aoa_start, usb_factory=usb_factory)
+                                     allow_aoa_start=aoa_start, usb_factory=usb_factory,
+                                     on_claim_wait=on_claim_wait, cancel=cancel)
 
 
-def _require_selected_enumeration(actual, expected):
-    """Reject a stale desktop picker selection before reading serial or AOA."""
-    names = ("bus", "ports", "vid", "pid", "address")
-    if any(getattr(actual, name) != getattr(expected, name) for name in names):
+def _require_selected_enumeration(actual, expected, *, allow_new_address=False):
+    names = ("bus", "ports", "vid", "pid")
+    if (any(getattr(actual, name) != getattr(expected, name) for name in names) or
+            (actual.address != expected.address and not allow_new_address)):
         raise USBEnumerationChanged("Selected USB device changed since discovery; refresh and select it again", actual)

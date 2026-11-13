@@ -1,4 +1,4 @@
-CarLife HeadUnit Emulator 0.5.1 для Windows x64 · 13 ноября 2026 года
+CarLife HeadUnit Emulator 0.5.1 для Windows x64 · обновлено 14 ноября 2026 года
 
 1. Распакуйте ZIP целиком в обычную папку. Не запускайте приложение внутри ZIP.
 2. Откройте CarLifeHeadUnitEmulator.exe. Python и Qt устанавливать отдельно не требуется.

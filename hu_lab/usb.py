@@ -72,7 +72,10 @@ def acquisition_stage(stage, selected_identity, *, attempted_identity=None, aoa_
             raise  # Preserve evidence from the most specific stage.
         native = isinstance(error, USBError)
         windows_reason = getattr(error, 'selection_reason', None)
-        if windows_reason is not None:
+        owner = getattr(error, 'claim_owner', None)
+        if owner:
+            reason = 'interface_owned'
+        elif windows_reason is not None:
             reason = 'windows_interface_selection'
         elif getattr(error, 'native_api', None) == 'WinUSB':
             reason = 'winusb_error'
@@ -97,6 +100,10 @@ def acquisition_stage(stage, selected_identity, *, attempted_identity=None, aoa_
             'code': error.code if native else None, 'name': error.name if native else None,
             'aoa_control_complete': aoa_control_complete,
         }
+        if owner:
+            error.connection_failure['claim_owner'] = owner
+        if hasattr(error, 'claim_attempts'):
+            error.connection_failure['claim_attempts'] = error.claim_attempts
         if windows_reason is not None:
             error.connection_failure['selection_reason'] = windows_reason
         details = getattr(error, 'windows_selection', None)
@@ -256,6 +263,7 @@ class LibUSB:
             raise RuntimeError('libusb 1.0 library unavailable')
         self.library = str(path)
         self._verify_winusb_accessory = sys.platform == 'win32'
+        self._darwin_claim_wait = sys.platform == 'darwin'
         self.lib = C.CDLL(path)
         signatures = {
             'libusb_init': ([C.POINTER(C.c_void_p)], C.c_int),
@@ -276,7 +284,8 @@ class LibUSB:
             'libusb_get_string_descriptor_ascii': ([C.c_void_p, C.c_uint8, C.POINTER(C.c_ubyte), C.c_int], C.c_int),
             'libusb_bulk_transfer': ([C.c_void_p, C.c_ubyte, C.POINTER(C.c_ubyte), C.c_int, C.POINTER(C.c_int), C.c_uint], C.c_int),
         }
-        if self._verify_winusb_accessory:
+        self._darwin_session_data = sys.platform == 'darwin' and hasattr(self.lib, 'libusb_get_session_data')
+        if self._verify_winusb_accessory or self._darwin_session_data:
             # libusb >=1.0.30, default Windows backend: the DEVINST of this
             # exact device. Bus numbers are libusb's own, not PnP bus numbers.
             signatures['libusb_get_session_data'] = ([C.c_void_p], C.c_ulong)
@@ -319,6 +328,8 @@ class LibUSB:
                   'serial_index': desc.iSerialNumber, 'interfaces': []}
         if getattr(self, '_verify_winusb_accessory', False):
             result['windows_devinst'] = self.lib.libusb_get_session_data(device)
+        if getattr(self, '_darwin_session_data', False) and ident.vid == 0x18d1 and ident.pid in (0x2d00, 0x2d01):
+            result['darwin_session_id'] = self.lib.libusb_get_session_data(device)
         config = C.POINTER(_Config)()
         rc = self.lib.libusb_get_active_config_descriptor(device, C.byref(config))
         if rc < 0:

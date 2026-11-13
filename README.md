@@ -1,6 +1,6 @@
 # CarLife HeadUnit Emulator
 
-**Stable release 0.5.1 · 13 November 2026** · [Русский](README.ru.md) · [Downloads](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/tag/v0.5.1) · [Changelog](CHANGELOG.md)
+**Stable release 0.5.1 · updated 14 November 2026** · [Русский](README.ru.md) · [Downloads](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/tag/v0.5.1) · [Changelog](CHANGELOG.md)
 
 An independent hobby desktop application that emulates a Baidu CarLife head unit for testing a compatible phone or Android box. It displays the projected video, plays received audio and sends touch, keyboard and media input. Extracted from [Carlife_on_box](https://github.com/SadykovIV/Carlife_on_box), with one Qt interface and session implementation for macOS and Windows.
 
@@ -40,6 +40,12 @@ open "CarLife HeadUnit Emulator.app" --args --demo
 Open **«Приборка и HUD»** to keep the phone projection on the left and see the next maneuver, distance, track and artist on the right. To try it without a phone or car, click **«Запустить демо приборки»**. With a phone connected, start a route or play music on it: navigation and music are negotiated independently and shown when the phone sends them. A received PNG provides the turn arrow; otherwise the panel uses the maneuver code.
 
 The desktop uses **CarLife v2 · Honda** for USB, Wi-Fi, compatible TCP streams and demo sessions. There is no protocol selector.
+
+### Reconnecting over USB
+
+If the phone is already in CarLife accessory mode, click **«Подключить»** (Connect). After a USB address change, the emulator can recognize a previously verified phone by its port and serial number. If another emulator window holds the port, click **«Отключить»** (Disconnect) in that window. The new connection waits up to a minute and continues as soon as the port becomes available.
+
+On macOS, the emulator also shows the name of an application holding the CarLife interface when the system provides it. If it shows `livi-helperd`, quit **LIVI** with **⌘Q**. If the phone is still in an Android Auto session, open HeadSwap, reconnect the cable once to the same port and click **«Подключить»**.
 
 ### First USB connection on Windows
 

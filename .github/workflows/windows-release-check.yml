@@ -12,6 +12,14 @@ on:
         description: Expected SHA256 of the complete Windows ZIP
         required: true
         type: string
+      package_version:
+        description: Version inside the ZIP when staging under a different draft tag
+        required: false
+        type: string
+      usb_regressions:
+        description: Run USB reconnect tests from the dispatched source commit against the extracted package
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -31,19 +39,25 @@ jobs:
     env:
       RELEASE_TAG: ${{ inputs.tag }}
       EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+      PACKAGE_VERSION: ${{ inputs.package_version }}
 
     steps:
       - name: Validate inputs and prepare isolated directories
         run: |
           $ErrorActionPreference = 'Stop'
           Set-StrictMode -Version Latest
-          if ($env:RELEASE_TAG -cnotmatch '\Av(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-rc\.[1-9][0-9]*)?\z') {
+          $versionPattern = '(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-rc\.[1-9][0-9]*)?'
+          if ($env:RELEASE_TAG -cnotmatch "\Av${versionPattern}\z") {
             throw 'Tag must have the form vX.Y.Z or vX.Y.Z-rc.N.'
           }
           if ($env:EXPECTED_SHA256 -notmatch '\A[0-9a-fA-F]{64}\z') {
             throw 'Expected SHA256 must be exactly 64 hexadecimal characters.'
           }
           $version = $env:RELEASE_TAG.Substring(1)
+          if (-not [string]::IsNullOrEmpty($env:PACKAGE_VERSION)) {
+            if ($env:PACKAGE_VERSION -cnotmatch "\A${versionPattern}\z") { throw 'Invalid package version.' }
+            $version = $env:PACKAGE_VERSION
+          }
           $name = "CarLife-HeadUnit-Emulator-$version-Windows-x64"
           $work = Join-Path $env:RUNNER_TEMP 'headunit-release-check'
           $smoke = Join-Path $env:RUNNER_TEMP 'headunit-smoke'
@@ -154,6 +168,62 @@ jobs:
             }
             'Native helper API check: PASS (no device or install).' | Set-Content "$env:CHECK_ROOT/logs/helper-api.log" -Encoding utf8
           }
+
+      - name: Check out USB regression tests from the dispatched commit
+        if: inputs.usb_regressions
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: tests
+
+      - name: Run USB reconnect and WinUSB tests with packaged Python
+        if: inputs.usb_regressions
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Join-Path $env:CHECK_ROOT 'usb-regressions.py'
+          @'
+          import hashlib
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import unittest
+
+          import hu_lab
+
+          package = Path(os.environ['PACKAGE_ROOT']).resolve()
+          checkout = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          if Path(hu_lab.__file__).resolve() != package / 'hu_lab' / '__init__.py':
+              raise RuntimeError('The USB tests must import the extracted release package')
+          sys.path.insert(0, str(checkout))
+          import tests
+          if Path(tests.__file__).resolve() != checkout / 'tests' / '__init__.py':
+              raise RuntimeError('The USB tests must come from the dispatched commit')
+          # Check the packaged implementation against Git objects. Sparse
+          # checkout deliberately leaves the source modules off sys.path.
+          tree = subprocess.check_output(
+              ['git', 'ls-tree', '-r', 'HEAD', 'hu_lab'], cwd=checkout, text=True)
+          for entry in tree.splitlines():
+              metadata, filename = entry.split('\t', 1)
+              if filename.endswith('.py'):
+                  data = (package / filename).read_bytes()
+                  blob = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data)
+                  if blob.hexdigest() != metadata.split()[2]:
+                      raise RuntimeError(f'Dispatched USB tests and packaged source differ: {filename}')
+
+          modules = ('test_usb_reselection', 'test_usb_claim_wait', 'test_desktop_session',
+                     'test_windows_usb_interfaces', 'test_windows_winusb')
+          suite = unittest.defaultTestLoader.loadTestsFromNames(['tests.' + name for name in modules])
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          if not result.wasSuccessful() or result.skipped or not result.testsRun:
+              raise SystemExit(1)
+          '@ | Set-Content -LiteralPath $script -Encoding utf8
+          & "$env:PACKAGE_ROOT/runtime/python.exe" -X utf8 $script *> "$env:CHECK_ROOT/logs/usb-regressions.log"
+          $result = $LASTEXITCODE
+          Get-Content -LiteralPath "$env:CHECK_ROOT/logs/usb-regressions.log"
+          if ($result -ne 0) { throw "Packaged USB regressions failed: exit $result" }
 
       - name: Run the packaged GUI demo and require clean shutdown
         timeout-minutes: 2

@@ -16,7 +16,8 @@ import struct
 import threading
 import time
 
-from .usb import LibUSB, RecoveryBlocked, USBIdentity, acquisition_stage, open_for_acquisition, select_exact
+from .usb import (LibUSB, RecoveryBlocked, USBError, USBIdentity, acquisition_stage,
+                  open_for_acquisition, select_bulk_pair, select_exact)
 from .platform_support import lock_owner, open_owner_lock, unlock_owner, usb_lock_directory
 
 ACCESSORY_IDS = ((0x18d1, 0x2d00), (0x18d1, 0x2d01))
@@ -25,6 +26,103 @@ ACCESSORY_IDS = ((0x18d1, 0x2d00), (0x18d1, 0x2d01))
 # the former laboratory identity switches USB mode but does not launch them.
 DEFAULT_STRINGS = ("Baidu", "CarLife", "Baidu CarLife",
                    "1.0.0", "http://carlife.baidu.com/", "0720SerialNo.")
+
+
+class USBInterfaceOwned(RecoveryBlocked):
+    """An exclusive owner was observed before making a libusb claim."""
+
+
+def _require_active(cancel):
+    if cancel is not None and cancel.is_set():
+        raise InterruptedError('USB connection cancelled')
+
+
+def wait_for_port_lock(owner, cancel, on_claim_wait):
+    """Acquire this file's lock or leave the current owner's handle untouched."""
+    deadline = time.monotonic() + 60
+    reported = False
+    while True:
+        _require_active(cancel)
+        try:
+            lock_owner(owner)
+            return
+        except BlockingIOError:
+            if on_claim_wait is None:
+                raise
+        name = 'CarLife HeadUnit Emulator'
+        if not reported:
+            on_claim_wait(name)
+            reported = True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            error = USBInterfaceOwned('Another CarLife session owns this USB port')
+            error.claim_owner = name
+            error.claim_attempts = 0
+            raise error
+        cancel.wait(min(.5, remaining))
+
+
+def acquire_usb_port(identity, cancel, on_claim_wait):
+    key = identity.physical_key.replace(":", "-")
+    with acquisition_stage("usb_port_lock", identity):
+        _require_active(cancel)
+        owner = open_owner_lock(usb_lock_directory() / f"carlife-usb-{key}.lock")
+        try:
+            try:
+                wait_for_port_lock(owner, cancel, on_claim_wait)
+            except BlockingIOError as error:
+                raise RecoveryBlocked("Selected USB port already owned by another CarLife HU process") from error
+            _require_active(cancel)
+            return owner
+        except BaseException:
+            owner.close()
+            raise
+
+
+def claim_accessory_when_available(handle, admission, cancel, on_claim_wait=None):
+    _require_active(cancel)
+    if not getattr(getattr(handle, 'usb', None), '_darwin_claim_wait', False):
+        return handle.claim_accessory(admission)
+
+    from .macos_usb_owner import accessory_interface_owner
+
+    # Validate the selected accessory before waiting. The native claim also
+    # rechecks admission immediately before claiming this same open handle.
+    admission.require(handle.identity)
+    select_bulk_pair(handle.descriptor)
+    if handle.descriptor.get('configuration') != 1:
+        raise RecoveryBlocked('Configuration is not 1; automatic SET_CONFIGURATION prohibited')
+
+    start = time.monotonic()
+    attempts = 0
+    last_error = None
+    previous_owner = None
+    while not cancel.is_set():
+        owner = accessory_interface_owner(handle)
+        _require_active(cancel)
+        if owner and on_claim_wait and owner != previous_owner:
+            on_claim_wait(owner)
+        previous_owner = owner
+        if not owner:
+            attempts += 1
+            try:
+                return handle.claim_accessory(admission)
+            except USBError as error:
+                if error.code not in (-3, -6):
+                    raise
+                last_error = error
+
+        # On Darwin, libusb 1.0.30 obtains an IOKit interface before
+        # USBInterfaceOpen returns exclusive access. Poll the read-only owner
+        # instead of repeatedly trying unsuccessful native claims.
+        remaining = start + (60 if owner and on_claim_wait else 3) - time.monotonic()
+        if remaining <= 0 or attempts >= 3:
+            failure = last_error or USBInterfaceOwned('CarLife accessory interface 0 is in use')
+            failure.claim_attempts = attempts
+            failure.claim_owner = owner
+            raise failure
+        cancel.wait(min(.5 if owner else 1.5, remaining))
+    raise InterruptedError('USB connection cancelled')
 
 
 @dataclass(frozen=True)
@@ -173,6 +271,8 @@ class USBStream:
                 # A timeout may have sent a prefix. Never retry this logical
                 # write or grant another startup window on this stream.
                 self.write_failed = True
+                if first and isinstance(error, TimeoutError):
+                    self.evidence['first_handshake_write_timeout'] = True
                 # Publish the cause before cancel wakes the reader. Otherwise
                 # its InterruptedError can win the client failure race.
                 self.failure_reason = f"{type(error).__name__}: {error}"
@@ -237,7 +337,8 @@ class NativeUSBTransportFactory:
     that a normal host-initiated transition succeeded.
     """
     def __init__(self, identity, admission, output_dir, *, allow_aoa_start=False,
-                 strings=DEFAULT_STRINGS, reenumeration_timeout=15, usb_factory=LibUSB):
+                 strings=DEFAULT_STRINGS, reenumeration_timeout=15, usb_factory=LibUSB,
+                 on_claim_wait=None, cancel=None):
         self.identity, self.admission = identity, admission
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -248,7 +349,8 @@ class NativeUSBTransportFactory:
         self.usb_factory = usb_factory
         self.start_requested = False
         self.invocations = 0
-        self.cancel = threading.Event()
+        self.cancel = cancel if cancel is not None else threading.Event()
+        self.on_claim_wait = on_claim_wait
         self.events = deque(maxlen=256)
         self.event_bytes = 0
 
@@ -283,18 +385,16 @@ class NativeUSBTransportFactory:
             os.fsync(handle.fileno())
         self.event("aoa_start_intent_durable", path=str(path), transition_sha256=ref["sha256"])
 
-    def __call__(self):
-        with acquisition_stage("native_discovery", self.identity):
-            self.admission.require(self.identity)
-            # A shared physical-port lock survives address/VID/PID changes.
-            key = self.identity.physical_key.replace(":", "-")
-            owner = open_owner_lock(usb_lock_directory() / f"carlife-usb-{key}.lock")
+    def __call__(self, *, acquired_port=None):
+        """Consume the desktop preflight's port lock or acquire one for a direct caller."""
+        owner = acquired_port
         usb = handle = None
         try:
-            try:
-                lock_owner(owner)
-            except BlockingIOError as error:
-                raise RecoveryBlocked("Selected USB port already owned by another CarLife HU process") from error
+            with acquisition_stage("native_discovery", self.identity):
+                _require_active(self.cancel)
+                self.admission.require(self.identity)
+            if owner is None:
+                owner = acquire_usb_port(self.identity, self.cancel, self.on_claim_wait)
             owner.seek(0)
             owner.truncate()
             owner.write(json.dumps({"pid": os.getpid(), "physical_key": self.identity.physical_key,
@@ -319,6 +419,7 @@ class NativeUSBTransportFactory:
             protocol = None
             if (selected_identity.vid, selected_identity.pid) not in ACCESSORY_IDS:
                 with acquisition_stage("aoa_control", self.identity):
+                    _require_active(self.cancel)
                     if not self.allow_aoa_start or self.start_requested:
                         raise RecoveryBlocked("No repeat AOA START; new normal-state transition needs a new reviewed transaction")
                     self._record_start_intent()
@@ -328,7 +429,12 @@ class NativeUSBTransportFactory:
                 # can be unknown. Never label it complete or repeat the switch.
                 with acquisition_stage("aoa_control", self.identity, attempted_identity=selected_identity,
                                        aoa_control_complete=None):
-                    protocol = handle.start_accessory(self.strings, self.admission, observer=self.event)
+                    def observe_request(stage, **details):
+                        self.event(stage, **details)
+                        if details.get("request") != 53:
+                            _require_active(self.cancel)
+                    _require_active(self.cancel)
+                    protocol = handle.start_accessory(self.strings, self.admission, observer=observe_request)
                 self.event("aoa_control_complete", aoa_version=protocol)
                 handle.close()
                 handle = None
@@ -342,7 +448,8 @@ class NativeUSBTransportFactory:
                 started_here = True
             with acquisition_stage("accessory_claim", self.identity, attempted_identity=selected_identity,
                                    aoa_control_complete=started_here):
-                handle.claim_accessory(self.admission)
+                claim_accessory_when_available(handle, self.admission, self.cancel, self.on_claim_wait)
+                _require_active(self.cancel)
             evidence = {"backend": "DIRECT_USB_AOA", "identity": asdict(selected_identity),
                         "bulk_pair": asdict(handle.pair), "aoa_version": protocol,
                         "entry": "HOST_INITIATED_51_52_53" if started_here else "ALREADY_ACCESSORY",
@@ -352,7 +459,7 @@ class NativeUSBTransportFactory:
                 evidence['windows_selection'] = handle.windows_selection
             self.event("accessory_claimed", **evidence)
             return USBStream(usb, handle, owner, evidence, observer=self.event)
-        except Exception as error:
+        except BaseException as error:
             # Keep the actual acquisition exception, even if a secondary
             # cleanup or a write to the diagnostic directory also fails.
             secondary = []
