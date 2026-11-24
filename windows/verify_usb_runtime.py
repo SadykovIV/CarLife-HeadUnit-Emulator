@@ -4,6 +4,7 @@ import ctypes
 import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
 import platform
 import sys
@@ -12,6 +13,16 @@ import sys
 class LibraryVersion(ctypes.Structure):
     _fields_ = [(name, ctypes.c_uint16) for name in ("major", "minor", "micro", "nano")]
     _fields_ += [("rc", ctypes.c_char_p), ("describe", ctypes.c_char_p)]
+
+
+def verify_driver_kit(root, kit):
+    for path_key, hash_key in (("installer", "sha256"), ("source", "source_sha256")):
+        with (root / kit[path_key]).open("rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != kit[hash_key]:
+                raise RuntimeError(f"Offline driver kit {path_key} hash mismatch")
+    if not (root / "Drivers" / "README.ru.txt").is_file():
+        raise RuntimeError("Offline driver instructions are missing")
+    return {"zadig_version": kit["version"], "sha256_verified": True}
 
 
 def check(root, report):
@@ -32,6 +43,12 @@ def check(root, report):
         report["library_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
     if report["library_sha256"] != expected["sha256"]:
         raise RuntimeError("Packaged libusb DLL hash mismatch")
+
+    report["stage"] = "verify_offline_driver_kit"
+    report["driver_kit"] = verify_driver_kit(root, info["driver_kit"])
+    drivers = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "drivers"
+    report["system_driver_files_present"] = {name: (drivers / name).is_file()
+                                               for name in ("WinUSB.sys", "UsbNcm.sys")}
 
     # Verify the dynamically resolved Windows dependencies used by the
     # accessory function opener without invoking any of their USB operations.

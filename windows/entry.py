@@ -29,8 +29,8 @@ def main():
         report.write_text(traceback.format_exc(), encoding='utf-8')
         if '--bundle-check' not in sys.argv and '--smoke-test' not in sys.argv:
             import ctypes
-            ctypes.windll.user32.MessageBoxW(None, f'Не удалось запустить CarLife HeadUnit Emulator.\n\nПодробности: {report}',
-                                            'CarLife HeadUnit Emulator', 0x10)
+            ctypes.windll.user32.MessageBoxW(None, f'Не удалось запустить HSD HeadUnit Emulator.\n\nПодробности: {report}',
+                                            'HSD HeadUnit Emulator', 0x10)
         return 1
 
 

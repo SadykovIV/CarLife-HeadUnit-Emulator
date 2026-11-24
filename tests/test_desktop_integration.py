@@ -105,7 +105,7 @@ class DesktopIntegrationTest(unittest.TestCase):
                 self.held_frame_resume(profile, idr=True)
 
     def test_both_profiles_decode_audio_input_pause_and_resume(self):
-        for profile in ("v1", "honda-v2"):
+        for profile in ("v1", "honda-v2", "carlife-2.1", "carlife-3.0", "carlife-3.1", "carlife-4.0", "carlife-4.1"):
             with self.subTest(profile=profile), demo_session(profile) as (client, peer, sink, frames):
                 self.assertEqual(client.session.accepted["width"], 320)
                 self.assertEqual(client.session.accepted["fps"], 15)

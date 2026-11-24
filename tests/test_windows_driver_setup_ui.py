@@ -116,6 +116,32 @@ class WindowsDriverSetupWindowTests(unittest.TestCase):
         self.assertIn('уже доступен',self.window.driver_status.text())
         self.assert_no_connect()
 
+    def test_driver_shortcut_selects_guidance_for_projection_transport(self):
+        self.window.family.setCurrentIndex(self.window.family.findData('carbit'))
+        self.assertFalse(self.window.driver_shortcut.isVisible())
+        self.window.transport.setCurrentIndex(self.window.transport.findData('usb'))
+        self.window.tabs.setCurrentIndex(0)
+        QTest.mouseClick(self.window.driver_shortcut, Qt.LeftButton)
+        self.assertEqual(self.window.tabs.currentIndex(), self.window.hud_tab_index)
+        self.assertTrue(self.window.driver_button.isVisible())
+        self.assertIn('CarbitLink', self.window.driver_status.text())
+        self.window.family.setCurrentIndex(self.window.family.findData('hicar'))
+        self.assertTrue(self.window.driver_group.isVisible())
+        self.assertFalse(self.window.driver_button.isVisible())
+        self.assertIn('NCM', self.window.driver_files.text())
+        self.window.setup_windows_driver()
+        self.inspect.assert_not_called()
+        self.apply.assert_not_called()
+
+    def test_single_function_accessory_offers_manual_kit(self):
+        index = self.window.usb_devices.currentIndex()
+        self.window.usb_devices.setItemData(index, {**asdict(self.ident), 'pid': 0x2d00})
+        QTest.mouseClick(self.window.driver_button, Qt.LeftButton)
+        self.assertIn('18D1:2D00', self.window.driver_status.text())
+        self.assertIn('Drivers', self.window.driver_status.text())
+        self.inspect.assert_not_called()
+        self.apply.assert_not_called()
+
     def test_cancel_is_default_and_escape_does_not_apply_the_driver(self):
         self.inspect.return_value=self.plan('install')
         with self.answer_modal(False) as dialogs:

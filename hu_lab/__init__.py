@@ -1,1 +1,3 @@
-"""Mac HU Lab: independent CarLife HU and explicit development transport."""
+"""HSD HeadUnit Emulator for desktop projection receivers."""
+
+__version__ = "0.6.0"

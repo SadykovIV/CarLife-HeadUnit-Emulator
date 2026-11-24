@@ -52,6 +52,21 @@ class ActivityBackend:
 
 @unittest.skipIf(desktop is None, "PySide6 and PyAV desktop extras are required")
 class DesktopWindowTests(unittest.TestCase):
+    def test_authenticated_profile_and_oem_preferences_survive_restart(self):
+        window = self.window
+        window.transport.setCurrentIndex(window.transport.findData('tcp'))
+        window.protocol_profile.setCurrentIndex(window.protocol_profile.findData('carlife-3.1'))
+        window.oem_channel.setText('assigned-channel')
+        window.cuid.setText('chosen-cuid')
+        window.require_encryption.setChecked(True)
+        window.save_settings()
+        window.protocol_profile.setCurrentIndex(0)
+        window.require_encryption.setChecked(False)
+        window.load_settings()
+        config = window.configuration()
+        self.assertEqual((config.profile, config.oem_channel, config.cuid, config.require_encryption),
+                         ('carlife-3.1', 'assigned-channel', 'chosen-cuid', True))
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])

@@ -20,6 +20,24 @@ PROBE_SPEC.loader.exec_module(probe)
 
 
 class WindowsPackagingTests(unittest.TestCase):
+    def make_driver_kit(self, root):
+        drivers = root / "Drivers"
+        drivers.mkdir()
+        (drivers / "README.ru.txt").write_text("USB")
+        for filename in ("zadig.exe", "source.zip"):
+            (drivers / filename).write_bytes(b"fixture")
+        digest = hashlib.sha256(b"fixture").hexdigest()
+        return {"version": "2.9", "installer": "Drivers/zadig.exe", "sha256": digest,
+                "source": "Drivers/source.zip", "source_sha256": digest}
+
+    def test_driver_kit_rejects_substituted_offline_installer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kit = self.make_driver_kit(root)
+            (root / kit["installer"]).write_bytes(b"modified")
+            with self.assertRaisesRegex(RuntimeError, "installer hash mismatch"):
+                probe.verify_driver_kit(root, kit)
+
     def test_library_probe_accepts_closed_null_context_on_empty_bus(self):
         from hu_lab import usb
 
@@ -34,7 +52,7 @@ class WindowsPackagingTests(unittest.TestCase):
             root = Path(directory)
             dll = root / "libusb-1.0.dll"
             dll.write_bytes(b"test binary")
-            info = {"version": builder.VERSION, "usb_library": {"version": "1.0.30",
+            info = {"version": builder.VERSION, "driver_kit": self.make_driver_kit(root), "usb_library": {"version": "1.0.30",
                     "sha256": hashlib.sha256(dll.read_bytes()).hexdigest(),
                     "required_exports": list(builder.REQUIRED_USB_EXPORTS)},
                     "windows_usb": {"modules": [], "system_exports": {"winusb.dll": ["WinUsb_QueryPipe"]}}}
@@ -47,6 +65,7 @@ class WindowsPackagingTests(unittest.TestCase):
                 probe.check(root, report)
         # Production LibUSB.close leaves a null ctypes.c_void_p(), not None.
         self.assertTrue(report["context_closed"])
+        self.assertTrue(report["driver_kit"]["sha256_verified"])
         self.assertEqual((report["status"], report["device_count"]), ("PASS", 0))
         win_dll.assert_called_once_with("winusb.dll", winmode=0x800, use_last_error=True)
         win_dll.return_value.WinUsb_QueryPipe.assert_not_called()

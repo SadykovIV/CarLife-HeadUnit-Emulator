@@ -76,7 +76,7 @@ class CodecTests(unittest.TestCase):
 
     def test_unknown_channel_fails(self):
         with self.assertRaises(ProtocolError):
-            FrameParser().feed(bytes.fromhex("0000000700000008"))
+            FrameParser().feed(bytes.fromhex("0000000800000008"))
 
     def test_unknown_message_retained(self):
         packet = FrameParser().feed(bytes.fromhex("0000000100000008000000000001ffff"))[0]
@@ -100,7 +100,7 @@ class CodecTests(unittest.TestCase):
                 fields(malformed)
 
     def test_all_six_channels_distinct(self):
-        for channel in range(1, 7):
+        for channel in range(1, 8):
             raw = bytes.fromhex("0000000100000008000000000001ffff") if channel == 1 else None
             packet = Packet(channel, channel << 16 | 1, b"sample", 17)
             decoded = FrameParser().feed(packet.encode())[0]

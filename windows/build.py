@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import runpy
 import shutil
 import struct
 import subprocess
@@ -22,10 +23,10 @@ import urllib.request
 import zipfile
 
 PROJECT = Path(__file__).resolve().parents[1]
-VERSION = "0.5.1"
-NAME = f"CarLife-HeadUnit-Emulator-{VERSION}-Windows-x64"
+VERSION = runpy.run_path(str(PROJECT / "hu_lab" / "__init__.py"))["__version__"]
+NAME = f"HSD-HeadUnit-Emulator-{VERSION}-Windows-x64"
 _release, _, _suffix = VERSION.partition("-")
-RELEASE_CHANNEL = "development" if _suffix.startswith("dev.") else "diagnostic-test" if _suffix else "stable"
+RELEASE_CHANNEL = "development" if _suffix.startswith("dev.") else "release-candidate" if _suffix else "stable"
 PE_FLAGS = 0x02 if _suffix else 0  # VS_FF_PRERELEASE for local/dev and RC builds.
 PE_VERSION = ",".join((*_release.split("."), _suffix.rsplit(".", 1)[-1] if _suffix else "0"))
 # ctypes resolves these at runtime, so they are not covered by PE import tables.
@@ -49,7 +50,7 @@ WINDOWS_USB_SYSTEM_EXPORTS = {
                      "CM_Get_Parent", "CM_Get_Child", "CM_Get_Sibling", "CM_Get_DevNode_Registry_PropertyW",
                      "CM_Enumerate_Classes", "CM_Get_Device_Interface_List_SizeW", "CM_Get_Device_Interface_ListW"),
 }
-SYSTEM_DLLS = set("""advapi32.dll authz.dll avicap32.dll avrt.dll bcrypt.dll cfgmgr32.dll
+SYSTEM_DLLS = set("""advapi32.dll authz.dll avicap32.dll avrt.dll bcrypt.dll bcryptprimitives.dll cfgmgr32.dll
 combase.dll comctl32.dll comdlg32.dll crypt32.dll cryptbase.dll cryptsp.dll d2d1.dll
 d3d9.dll d3d11.dll d3d12.dll d3dcompiler_47.dll dcomp.dll dnsapi.dll dwmapi.dll
 dwrite.dll dxgi.dll dxva2.dll evr.dll gdi32.dll hid.dll icu.dll icuuc.dll imagehlp.dll
@@ -98,6 +99,26 @@ def snapshot():
     paths += list((PROJECT / "windows").glob("*"))
     paths += [PROJECT / "macos" / "entry.py", PROJECT / "macos" / "build.py"]
     return {str(path.relative_to(PROJECT)): sha256(path) for path in sorted(paths) if path.is_file()}
+
+
+def bundle_driver_kit(stage, cache, kit):
+    drivers = stage / "Drivers"
+    drivers.mkdir()
+    licenses = stage / "licenses" / "Zadig"
+    licenses.mkdir(parents=True)
+    installer = drivers / kit["installer"]["filename"]
+    source = licenses / kit["source"]["filename"]
+    for artifact, record in ((installer, kit["installer"]), (source, kit["source"])):
+        shutil.copy2(cache / record["filename"], artifact)
+        if sha256(artifact) != record["sha256"]:
+            raise RuntimeError(f"USB driver kit hash mismatch: {artifact.name}")
+    with zipfile.ZipFile(source) as archive:
+        for name in ("COPYING", "COPYING-LGPL"):
+            (licenses / name).write_bytes(archive.read(f'libwdi-{kit["source"]["version"]}/{name}'))
+    shutil.copy2(PROJECT / "windows" / "DRIVERS.ru.txt", drivers / "README.ru.txt")
+    return {"version": kit["installer"]["version"], "installer": installer.relative_to(stage).as_posix(),
+            "sha256": kit["installer"]["sha256"], "source": source.relative_to(stage).as_posix(),
+            "source_sha256": kit["source"]["sha256"]}
 
 
 def llvm_tool(name):
@@ -176,9 +197,9 @@ def compile_launcher(stage, work):
         f'1 VERSIONINFO\nFILEVERSION {PE_VERSION}\nPRODUCTVERSION {PE_VERSION}\n'
         f'FILEFLAGSMASK 0x3F\nFILEFLAGS 0x{PE_FLAGS:02X}\nFILEOS 0x40004\nFILETYPE 1\nBEGIN\n'
         'BLOCK "StringFileInfo" BEGIN BLOCK "040904B0" BEGIN\n'
-        'VALUE "FileDescription", "CarLife HeadUnit Emulator"\nVALUE "ProductName", "CarLife HeadUnit Emulator"\n'
+        'VALUE "FileDescription", "HSD HeadUnit Emulator"\nVALUE "ProductName", "HSD HeadUnit Emulator"\n'
         f'VALUE "FileVersion", "{VERSION}"\nVALUE "ProductVersion", "{VERSION}"\n'
-        'VALUE "OriginalFilename", "CarLifeHeadUnitEmulator.exe"\nEND END\n'
+        'VALUE "OriginalFilename", "HSDHeadUnitEmulator.exe"\nEND END\n'
         'BLOCK "VarFileInfo" BEGIN VALUE "Translation", 0x409, 1200 END\nEND\n')
     subprocess.run([llvm_tool("llvm-rc"), "/fo", "launcher.res", "launcher.rc"], cwd=work, check=True)
     subprocess.run([llvm_tool("clang"), "--target=x86_64-pc-windows-msvc", "-O2", "-ffreestanding",
@@ -186,7 +207,7 @@ def compile_launcher(stage, work):
                     "-o", str(work / "launcher.obj")], check=True)
     subprocess.run([llvm_tool("lld-link"), "/machine:x64", "/subsystem:windows", "/entry:mainCRTStartup",
                     "/nodefaultlib", "/dynamicbase", "/nxcompat", "/highentropyva", "/timestamp:0",
-                    "/out:" + str(stage / "CarLifeHeadUnitEmulator.exe"), str(work / "launcher.obj"),
+                    "/out:" + str(stage / "HSDHeadUnitEmulator.exe"), str(work / "launcher.obj"),
                     str(work / "launcher.res"), *libraries], check=True)
 
 
@@ -208,8 +229,8 @@ def compile_driver_setup(stage, work, header_archive, header_record):
         f'1 VERSIONINFO\nFILEVERSION {PE_VERSION}\nPRODUCTVERSION {PE_VERSION}\n'
         f'FILEFLAGSMASK 0x3F\nFILEFLAGS 0x{PE_FLAGS:02X}\nFILEOS 0x40004\nFILETYPE 1\nBEGIN\n'
         'BLOCK "StringFileInfo" BEGIN BLOCK "040904B0" BEGIN\n'
-        'VALUE "FileDescription", "CarLife HeadUnit Emulator - AOA MI_00 WinUSB setup"\n'
-        'VALUE "ProductName", "CarLife HeadUnit Emulator"\n'
+        'VALUE "FileDescription", "HSD HeadUnit Emulator - AOA MI_00 WinUSB setup"\n'
+        'VALUE "ProductName", "HSD HeadUnit Emulator"\n'
         f'VALUE "FileVersion", "{VERSION}"\nVALUE "ProductVersion", "{VERSION}"\n'
         f'VALUE "OriginalFilename", "{name}"\nEND END\n'
         'BLOCK "VarFileInfo" BEGIN VALUE "Translation", 0x409, 1200 END\nEND\n', encoding="ascii")
@@ -339,7 +360,7 @@ def main():
     args = parser.parse_args()
     args.cache_dir.mkdir(parents=True, exist_ok=True)
     dependencies = json.loads((PROJECT / "windows" / "dependencies.json").read_text())
-    records = [dependencies["python"], *dependencies["wheels"]]
+    records = [dependencies["python"], *dependencies["wheels"], *dependencies["driver_kit"].values()]
     with ThreadPoolExecutor(max_workers=4) as workers:
         list(workers.map(lambda record: download(record, args.cache_dir), records))
     args.headers_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -381,24 +402,29 @@ def main():
         usb_library = verify_usb_library(stage / "libusb-1.0.dll", usb_record)
         licenses = stage / "licenses"
         licenses.mkdir()
+        subprocess.run([sys.executable, str(PROJECT / "native/hicar/build.py"), "windows-x64",
+                        "--bundle-to", str(stage / "hu_lab/hicar"), "--licenses-to", str(licenses)], check=True)
         for name in ("LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"):
             shutil.copy2(PROJECT / name, licenses / name)
         shutil.copy2(PROJECT / "hu_lab" / "assets" / "ICON_SOURCE.json", licenses / "Baidu-CarLife-artwork.json")
         shutil.copy2(PROJECT / "windows" / "README.ru.txt", stage / "README.ru.txt")
-        (stage / "Verify.cmd").write_text('@echo off\r\n"%~dp0CarLifeHeadUnitEmulator.exe" --bundle-check --check-output "%TEMP%\\carlife-bundle-check.json"\r\nif errorlevel 1 exit /b 1\r\ntype "%TEMP%\\carlife-bundle-check.json"\r\n', encoding="ascii")
+        (stage / "Verify.cmd").write_text('@echo off\r\n"%~dp0HSDHeadUnitEmulator.exe" --bundle-check --check-output "%TEMP%\\carlife-bundle-check.json"\r\nif errorlevel 1 exit /b 1\r\ntype "%TEMP%\\carlife-bundle-check.json"\r\n', encoding="ascii")
         (stage / "VerifyUsbRuntime.cmd").write_bytes(
             b'@echo off\r\n"%~dp0runtime\\python.exe" -X utf8 "%~dp0verify_usb_runtime.py" --output "%TEMP%\\carlife-libusb-check.json"\r\nexit /b %errorlevel%\r\n')
         compile_launcher(stage, work)
         driver_setup_helper = compile_driver_setup(stage, work, header_archive, header_record)
         # All extracted licenses and original distribution metadata stay present.
         native, system_imports = trim_qt_and_verify(stage)
+        # Zadig is upstream's standalone, signed x86 program. The emulator and
+        # everything it loads in-process have already passed the x64 PE checks.
+        driver_kit = bundle_driver_kit(stage, args.cache_dir, dependencies["driver_kit"])
         after = snapshot()
         if before != after:
             raise RuntimeError("Source changed during packaging; rerun after edits finish")
-        info = {"name": "CarLife HeadUnit Emulator", "version": VERSION, "architecture": "x64", "platform": "win32",
+        info = {"name": "HSD HeadUnit Emulator", "version": VERSION, "architecture": "x64", "platform": "win32",
                 "python": dependencies["python"]["version"], "built_utc": datetime.now(timezone.utc).isoformat(),
                 "release_channel": RELEASE_CHANNEL, "usb_library": usb_library,
-                "driver_setup_helper": driver_setup_helper, "build_headers": header_record,
+                "driver_setup_helper": driver_setup_helper, "driver_kit": driver_kit, "build_headers": header_record,
                 "windows_usb": {"modules": list(WINDOWS_USB_MODULES),
                                 "system_exports": WINDOWS_USB_SYSTEM_EXPORTS},
                 "dependencies": {r["name"]: r["version"] for r in dependencies["wheels"]},

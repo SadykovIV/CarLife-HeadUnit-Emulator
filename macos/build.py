@@ -10,11 +10,13 @@ import json
 import os
 from pathlib import Path
 import platform
+import runpy
 import shutil
 import subprocess
 import sys
 
 PROJECT = Path(__file__).resolve().parents[1]
+VERSION = runpy.run_path(str(PROJECT / "hu_lab" / "__init__.py"))["__version__"]
 
 
 def make_icon(path: Path) -> None:
@@ -32,7 +34,8 @@ def collect_licenses(destination: Path, library: Path) -> dict[str, str]:
         shutil.copy2(PROJECT / name, destination / name)
     shutil.copy2(PROJECT / "hu_lab" / "assets" / "ICON_SOURCE.json", destination / "Baidu-CarLife-artwork.json")
     versions = {}
-    for name in ("PyInstaller", "PySide6", "PySide6_Essentials", "PySide6_Addons", "shiboken6", "av", "Pillow"):
+    for name in ("PyInstaller", "PySide6", "PySide6_Essentials", "PySide6_Addons", "shiboken6", "av",
+                 "Pillow", "cryptography", "cffi", "pycparser"):
         dist = importlib.metadata.distribution(name)
         versions[name] = dist.version
         target = destination / name
@@ -102,12 +105,15 @@ def main() -> int:
     if (assets / "licenses").exists():
         shutil.rmtree(assets / "licenses")
     versions = collect_licenses(assets / "licenses", args.libusb)
+    subprocess.run([sys.executable, str(PROJECT / "native/hicar/build.py"), "macos-arm64",
+                    "--bundle-to", str(assets), "--licenses-to", str(assets / "licenses")], check=True)
     (assets / "build-info.json").write_text(json.dumps({
-        "name": "CarLife HeadUnit Emulator", "version": "0.5.1", "release_channel": "stable", "architecture": "arm64",
+        "name": "HSD HeadUnit Emulator", "version": VERSION, "architecture": "arm64",
+        "release_channel": "development" if "-dev." in VERSION else "release-candidate" if "-" in VERSION else "stable",
         "minimum_macos": "determined from bundled binaries", "python": platform.python_version(),
         "built_utc": datetime.now(timezone.utc).isoformat(), "dependencies": versions,
         "source_sha256": {str(path.relative_to(PROJECT)): hashlib.sha256(path.read_bytes()).hexdigest()
-                          for path in sorted([*(PROJECT / "hu_lab").glob("*.py"),
+                          for path in sorted([*(PROJECT / "hu_lab").rglob("*.py"),
                                              *(PROJECT / "hu_lab" / "assets").glob("*")]) if path.is_file()},
     }, indent=2) + "\n")
     environment = dict(os.environ, CARLIFE_BUILD_ASSETS=str(assets),
@@ -116,12 +122,12 @@ def main() -> int:
     # An unrelated source checkout in PYTHONPATH must never enter the app snapshot.
     environment.pop("PYTHONPATH", None)
     command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--distpath", str(args.dist_dir.absolute()),
-               "--workpath", str(build_root / "pyinstaller"), str(PROJECT / "macos" / "CarLifeHeadUnit.spec")]
+               "--workpath", str(build_root / "pyinstaller"), str(PROJECT / "macos" / "HSDHeadUnit.spec")]
     if args.clean:
         command.insert(3, "--clean")
     subprocess.run(command, cwd=PROJECT, env=environment, check=True)
-    app = args.dist_dir.absolute() / "CarLife HeadUnit Emulator.app"
-    executable = app / "Contents" / "MacOS" / "CarLife HeadUnit Emulator"
+    app = args.dist_dir.absolute() / "HSD HeadUnit Emulator.app"
+    executable = app / "Contents" / "MacOS" / "HSD HeadUnit Emulator"
     subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)], check=True)
     architecture = subprocess.check_output(["/usr/bin/lipo", "-archs", str(executable)], text=True).strip()
     if architecture != "arm64":

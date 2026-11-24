@@ -35,7 +35,7 @@ def select_port(devices, physical_key):
 
 
 def prepare_usb(physical_key, output, *, aoa_start=False, usb_factory=LibUSB, expected_identity=None,
-                on_claim_wait=None, cancel=None):
+                on_claim_wait=None, cancel=None, strings=None):
     """Read the selected serial, then create a factory; no AOA request/claim here."""
     output = Path(output)
     with acquisition_stage('preflight_discovery', expected_identity):
@@ -77,6 +77,7 @@ def prepare_usb(physical_key, output, *, aoa_start=False, usb_factory=LibUSB, ex
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
     return NativeUSBTransportFactory(identity, admission, output,
                                      allow_aoa_start=aoa_start, usb_factory=usb_factory,
+                                     **({"strings": strings} if strings is not None else {}),
                                      on_claim_wait=on_claim_wait, cancel=cancel)
 
 

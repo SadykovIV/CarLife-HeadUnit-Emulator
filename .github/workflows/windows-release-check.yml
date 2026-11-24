@@ -6,7 +6,7 @@ on:
       tag:
         description: Release tag whose Windows ZIP should be tested
         required: true
-        default: v0.5.1
+        default: v0.6.0
         type: string
       expected_sha256:
         description: Expected SHA256 of the complete Windows ZIP
@@ -58,7 +58,10 @@ jobs:
             if ($env:PACKAGE_VERSION -cnotmatch "\A${versionPattern}\z") { throw 'Invalid package version.' }
             $version = $env:PACKAGE_VERSION
           }
-          $name = "CarLife-HeadUnit-Emulator-$version-Windows-x64"
+          $old = ([version](($version -split '-')[0])) -lt [version]'0.6.0' -or $version -eq '0.6.0-dev.1'
+          $brand = if ($old) { 'CarLife' } else { 'HSD' }
+          $name = "$brand-HeadUnit-Emulator-$version-Windows-x64"
+          "LAUNCHER=${brand}HeadUnitEmulator.exe" >> $env:GITHUB_ENV
           $work = Join-Path $env:RUNNER_TEMP 'headunit-release-check'
           $smoke = Join-Path $env:RUNNER_TEMP 'headunit-smoke'
           New-Item -ItemType Directory -Path "$work/download", "$work/unpacked", "$work/logs", "$work/temp", "$work/localappdata", $smoke | Out-Null
@@ -86,7 +89,7 @@ jobs:
           }
           "Asset: $env:ASSET_NAME`nSHA256: $actual" | Set-Content "$env:CHECK_ROOT/logs/asset.log" -Encoding utf8
           Expand-Archive -LiteralPath $archive -DestinationPath "$env:CHECK_ROOT/unpacked"
-          foreach ($relative in @('CarLifeHeadUnitEmulator.exe', 'Verify.cmd', 'runtime/pythonw.exe', 'build-info.json')) {
+          foreach ($relative in @($env:LAUNCHER, 'Verify.cmd', 'runtime/pythonw.exe', 'build-info.json')) {
             if (-not (Test-Path -LiteralPath (Join-Path $env:PACKAGE_ROOT $relative) -PathType Leaf)) {
               throw "Missing package file: $relative"
             }
@@ -168,6 +171,16 @@ jobs:
             }
             'Native helper API check: PASS (no device or install).' | Set-Content "$env:CHECK_ROOT/logs/helper-api.log" -Encoding utf8
           }
+          if ($null -ne $build.PSObject.Properties['driver_kit']) {
+            $kit = $build.driver_kit
+            $installer = Join-Path $env:PACKAGE_ROOT $kit.installer
+            $signature = Get-AuthenticodeSignature -LiteralPath $installer
+            if ($check.driver_kit.sha256_verified -ne $true -or $signature.Status -ne 'Valid' -or
+                $signature.SignerCertificate.GetNameInfo('SimpleName', $false) -ne 'Akeo Consulting') {
+              throw 'Offline WinUSB kit hash, Authenticode signature or publisher mismatch.'
+            }
+            "Zadig $($kit.version): Akeo Consulting, verified" | Set-Content "$env:CHECK_ROOT/logs/offline-drivers.log" -Encoding utf8
+          }
 
       - name: Check out USB regression tests from the dispatched commit
         if: inputs.usb_regressions
@@ -236,7 +249,7 @@ jobs:
           Remove-Item Env:QT_QPA_PLATFORM -ErrorAction SilentlyContinue
           $arguments = "--demo --smoke-test 8 --data-dir `"$env:SMOKE_ROOT`""
           try {
-            $process = Start-Process -FilePath "$env:PACKAGE_ROOT/CarLifeHeadUnitEmulator.exe" -ArgumentList $arguments -WorkingDirectory $env:PACKAGE_ROOT -Wait -PassThru -RedirectStandardOutput "$env:CHECK_ROOT/logs/demo.stdout.log" -RedirectStandardError "$env:CHECK_ROOT/logs/demo.stderr.log"
+            $process = Start-Process -FilePath "$env:PACKAGE_ROOT/$env:LAUNCHER" -ArgumentList $arguments -WorkingDirectory $env:PACKAGE_ROOT -Wait -PassThru -RedirectStandardOutput "$env:CHECK_ROOT/logs/demo.stdout.log" -RedirectStandardError "$env:CHECK_ROOT/logs/demo.stderr.log"
             if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) {
               throw "Packaged GUI demo failed: exit $($process.ExitCode)"
             }

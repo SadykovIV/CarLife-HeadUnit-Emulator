@@ -12,10 +12,10 @@ from hu_lab.wireless import (CHANNEL_PORTS, TCP6Stream, InnerChannelParser, Wire
 
 
 class SixListeners:
-    def __init__(self):
+    def __init__(self, channels=CHANNEL_PORTS):
         self.listeners = {}
         self.peers = {}
-        for channel in CHANNEL_PORTS:
+        for channel in channels:
             listener = socket.socket()
             listener.bind(('127.0.0.1', 0))
             listener.listen(1)
@@ -36,6 +36,25 @@ class SixListeners:
             except OSError:
                 pass
             sock.close()
+
+
+class SDKChannelTests(unittest.TestCase):
+    def test_update_channel_and_six_service_phone(self):
+        from hu_lab.protocol import UPDATE
+        for has_update in (True, False):
+            with self.subTest(has_update=has_update):
+                server = SixListeners(range(1, 8))
+                self.addCleanup(server.close)
+                if not has_update:
+                    server.listeners.pop(UPDATE).close()
+                stream = TCP6Stream.connect('127.0.0.1', ports=server.ports, try_update=True)
+                self.addCleanup(stream.close)
+                peers = server.accept()
+                self.assertEqual(stream.evidence['connected_channels'], len(peers))
+                if has_update:
+                    wire = Packet(UPDATE, 0x70001, b'example', 123).encode()
+                    peers[UPDATE].sendall(wire[8:])
+                    self.assertEqual(stream.recv(128), wire)
 
 
 class WirelessWireTests(unittest.TestCase):
@@ -77,6 +96,17 @@ class WirelessWireTests(unittest.TestCase):
         self.assertEqual(self.receive_packet(), sound)
         self.peers[VIDEO].sendall(video.encode()[19:])
         self.assertEqual(self.receive_packet(), video)
+
+    def test_final_auth_verdict_is_delivered_when_video_closes(self):
+        from hu_lab.honda_reference import MD_AUTHEN_RESULT
+        from hu_lab.protocol import protobuf
+        refusal = Packet(CMD, MD_AUTHEN_RESULT, protobuf(f1=0))
+        self.peers[CMD].sendall(refusal.encode()[8:])
+        self.peers[VIDEO].shutdown(socket.SHUT_WR)
+        self.assertEqual(self.receive_packet(), refusal)
+        with self.assertRaisesRegex(ConnectionError, 'VIDEO'):
+            self.stream.recv(1024)
+        self.assertTrue(self.stream.closed.is_set())
 
     def test_partial_header_eof_fails_and_closes_all_sockets(self):
         self.peers[VIDEO].sendall(b'\x00\x00')

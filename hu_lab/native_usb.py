@@ -49,7 +49,7 @@ def wait_for_port_lock(owner, cancel, on_claim_wait):
         except BlockingIOError:
             if on_claim_wait is None:
                 raise
-        name = 'CarLife HeadUnit Emulator'
+        name = 'HSD HeadUnit Emulator'
         if not reported:
             on_claim_wait(name)
             reported = True
@@ -234,8 +234,15 @@ class USBStream:
                 raise ValueError("USB sendall requires one complete CarLife packet")
             channel, inner_size = struct.unpack_from(">II", data)
             minimum = 8 if channel in (1, 6) else 12
-            if (channel not in range(1, 7) or not minimum <= inner_size <= 4 * 1024 * 1024
+            if (channel not in range(1, 8) or not minimum <= inner_size <= 4 * 1024 * 1024
                     or len(data) != inner_size + 8):
+                raise ValueError("USB sendall requires one complete CarLife packet")
+            if minimum == 8:
+                declared, reserved, message = struct.unpack_from(">HHI", data, 8)
+            else:
+                declared, _, message = struct.unpack_from(">III", data, 8)
+                reserved = 0
+            if reserved or message >> 16 != channel or declared != inner_size - minimum:
                 raise ValueError("USB sendall requires one complete CarLife packet")
             first = not self.first_write_complete
             # The gadget can enumerate before the MD queues its first read.
@@ -287,6 +294,26 @@ class USBStream:
             if first and self.observer:
                 self.observer("usb_first_write_complete", bytes=written, deadline_seconds=budget,
                               elapsed_ms=(time.monotonic_ns()-started)/1e6)
+
+    def write_accessory_record(self, header, body):
+        """Write a WeLink or EasyConn record, preserving Android's two bulk reads."""
+        if len(header) not in (8, 24) or len(body) > 2 * 1024 * 1024:
+            raise ValueError("Invalid accessory record length")
+        with self.send_lock:
+            if self.closed or self.write_failed:
+                raise OSError("Accessory stream closed")
+            deadline = time.monotonic() + 3
+            try:
+                for part in (header, body):
+                    if part:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or self.handle.write(part, remaining) != len(part):
+                            raise OSError("Incomplete accessory record")
+                        self.tx_bytes += len(part)
+            except Exception:
+                self.write_failed = True
+                self.handle.cancel.set()
+                raise
 
     def shutdown(self, _how=socket.SHUT_RDWR):
         self.handle.cancel.set()

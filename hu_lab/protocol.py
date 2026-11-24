@@ -9,7 +9,7 @@ socket does NOT demonstrate AOA or legacy six-socket TCP interoperability.
 from dataclasses import dataclass
 import struct
 
-CMD, VIDEO, MEDIA, TTS, VR, TOUCH = range(1, 7)
+CMD, VIDEO, MEDIA, TTS, VR, TOUCH, UPDATE = range(1, 8)
 HU_VERSION, VERSION_MATCH, HU_INFO, MD_INFO = 0x18001, 0x10002, 0x18003, 0x10004
 VIDEO_INIT, VIDEO_INIT_DONE = 0x18007, 0x10008
 VIDEO_START, VIDEO_PAUSE, VIDEO_RESET, VIDEO_FPS = 0x18009, 0x1800A, 0x1800B, 0x1800C
@@ -37,7 +37,7 @@ class Packet:
     timestamp: int = 0
 
     def encode(self):
-        if self.channel not in range(1, 7):
+        if self.channel not in range(1, UPDATE + 1):
             raise ProtocolError("unsupported channel")
         if self.message >> 16 != self.channel:
             raise ProtocolError("message/channel mismatch")
@@ -72,7 +72,7 @@ class FrameParser:
         result = []
         while len(self.buffer) >= 8:
             channel, length = struct.unpack_from(">II", self.buffer)
-            if channel not in range(1, 7):
+            if channel not in range(1, UPDATE + 1):
                 raise ProtocolError("unknown channel")
             header = 8 if channel in (CMD, TOUCH) else 12
             if not header <= length <= self.maximum:

@@ -367,6 +367,7 @@ class HUClient:
         self.sock = None
         self.error = None
         self.failure_lock = threading.Lock()
+        self.wire_write_lock = threading.Lock()
         self.start_time = None
         self.end_time = None
         self.decoded_frames = 0
@@ -500,11 +501,11 @@ class HUClient:
         self.threads = [threading.Thread(target=self._guard, args=(fn,), name=name, daemon=True)
                         for name, fn in (("carlife-writer", self._writer), ("carlife-decoder", self._decoder),
                                          ("carlife-reader", self._reader))]
-        for thread in self.threads:
-            thread.start()
         for packet in self.session.start():
             self._check_native_handshake_deadline()
             self.send(packet)
+        for thread in self.threads:
+            thread.start()
         return self
 
     def _guard(self, fn):
@@ -515,8 +516,9 @@ class HUClient:
                 first_failure = not self.halt.is_set()
                 if first_failure:
                     origin = getattr(self.sock, "failure_reason", None)
-                    self.error = (origin if origin and (isinstance(error, InterruptedError) or self.backend == "TCP6_WIFI")
-                                  else f"{type(error).__name__}: {error}")
+                    transport_error = origin if isinstance(error, InterruptedError) or self.backend == "TCP6_WIFI" else None
+                    self.error = (getattr(self.session, 'failure_reason', None) or transport_error or
+                                  f"{type(error).__name__}: {error}")
                     if self.session.state != "BLOCKED_AUTH":
                         self.session.state = "ERROR"
                     self.halt.set()
@@ -546,26 +548,34 @@ class HUClient:
         except queue.Full:
             raise ProtocolError("command queue full")
 
-    def _writer(self):
-        next_heartbeat = time.monotonic() + 1.0
-        def write(packet):
-            wire = packet.encode()
+    def _record_wire(self, direction, packet, wire=None):
+        self.trace.wire(direction, wire if wire is not None else packet.encode())
+        self.trace.packet(direction, packet)
+
+    def _write_packet(self, packet):
+        wire = packet.encode()
+        with self.wire_write_lock:
             with self._pipeline_stage(self.io_stage + "_write"):
                 self.sock.sendall(wire)
             self._progress(self.io_stage + "_write")
-            self.trace.wire("tx", wire)
-            self.trace.packet("tx", packet)
+            self._record_wire("tx", packet, wire)
+
+    def _heartbeat_due(self):
+        return self.backend == "TCP6_WIFI" and self.session.state in ("STREAMING", "PAUSED")
+
+    def _writer(self):
+        next_heartbeat = time.monotonic() + 1.0
         while not self.halt.is_set():
             try:
                 packet = self.commands.get(timeout=.2)
             except queue.Empty:
                 packet = None
             if packet is not None:
-                write(packet)
+                self._write_packet(packet)
                 self.commands.task_done()
-            if self.backend == "TCP6_WIFI" and time.monotonic() >= next_heartbeat:
-                if self.session.state in ("STREAMING", "PAUSED") and not self.halt.is_set():
-                    write(Packet(VIDEO, VIDEO_HEARTBEAT))
+            if time.monotonic() >= next_heartbeat:
+                if self._heartbeat_due() and not self.halt.is_set():
+                    self._write_packet(Packet(VIDEO, VIDEO_HEARTBEAT))
                 next_heartbeat = time.monotonic() + 1.0
 
     def _reader(self):
@@ -609,8 +619,7 @@ class HUClient:
                 self._progress("framed_packets", len(packets))
                 for packet in packets:
                     # Retain complete packet prefixes even when the byte budget ends.
-                    self.trace.wire("rx", packet.encode())
-                    self.trace.packet("rx", packet)
+                    self._record_wire("rx", packet)
                     self._receive_packet(packet, video, received_ns=time.monotonic_ns())
                     if (self.native_drain_since is not None and packet.channel in (MEDIA, TTS, VR)
                             and packet.message in (0x30006, 0x40003, 0x50003) and packet.payload):

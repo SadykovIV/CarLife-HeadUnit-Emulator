@@ -11,16 +11,20 @@ import os
 from pathlib import Path
 import sys
 import threading
+from functools import partial
+import uuid
 
+from .receiver import ACCESSORIES, MODES, ReceiverClient
 from .client import HUClient
-from .cluster import DesktopClusterSession
+from .cluster import DesktopClusterSession, MEDIA_INFO, MEDIA_PROGRESS_BAR, MODULE_STATUS, NAVI_NEXT_TURN_INFO, SUBSCRIBE_DONE
 from .honda_reference import HondaReferenceSession
 from .honda_reference_client import HondaReferenceClient
+from .modern import AuthError, ModernSession, VERSIONS, load_oem_registration
 from .native_usb import (ACCESSORY_IDS, USBStream, _require_active, acquire_usb_port,
                          claim_accessory_when_available, wait_for_port_lock)
 from .protocol import (HUSession, Packet, ProtocolError, TOUCH, HARD_KEY, protobuf)
 from .touch import profile_name
-from .usb import LibUSB, USBIdentity, acquisition_stage, open_for_acquisition, select_exact, select_bulk_pair
+from .usb import LibUSB, USBError, USBIdentity, acquisition_stage, open_for_acquisition, select_exact, select_bulk_pair
 from .platform_support import bundled_libusb, open_owner_lock, usb_lock_directory
 
 
@@ -178,12 +182,13 @@ class ExplicitAOATransportFactory:
     chosen enumeration and actual serial, and NativeUSBTransportFactory records
     its single AOA START intent before sending any mode-changing request.
     """
-    def __init__(self, identity, output_dir, *, usb_factory=None, on_claim_wait=None, cancel=None):
+    def __init__(self, identity, output_dir, *, usb_factory=None, on_claim_wait=None, cancel=None, strings=None):
         self.identity = _identity(identity)
         _require_physical_identity(self.identity)
         self.output_dir = Path(output_dir)
         self.usb_factory = usb_factory or _desktop_usb_factory
         self.prepared = None
+        self.strings = strings
         self.cancel = cancel if cancel is not None else threading.Event()
         self.on_claim_wait = on_claim_wait
 
@@ -196,7 +201,8 @@ class ExplicitAOATransportFactory:
                 from .public import prepare_usb
                 self.prepared = prepare_usb(self.identity.physical_key, self.output_dir,
                     aoa_start=True, usb_factory=self.usb_factory, expected_identity=self.identity,
-                    on_claim_wait=self.on_claim_wait, cancel=self.cancel)
+                    on_claim_wait=self.on_claim_wait, cancel=self.cancel,
+                    **({"strings": self.strings} if self.strings is not None else {}))
         except BaseException:
             owner.close()
             raise
@@ -220,21 +226,37 @@ class DesktopConfig:
     # that require exact dimensions can still opt into the strict lab policy.
     allow_mode_fallback: bool = True
     aoa_start: bool = False
+    oem_channel: str = ""
+    cuid: str = ""
+    night_mode: bool = False
+    require_encryption: bool = False
+    registration_file: str = ""
+
+    prefix_length: int = 24
 
     def validate(self):
-        if self.transport not in ("tcp", "usb", "wifi"):
+        family = self.profile if self.profile in ACCESSORIES or self.profile == "hicar" else "carlife"
+        if self.transport not in MODES[family] or self.transport == "demo":
             raise ValueError("Supported connections are native Wi-Fi, a TCP development stream, or USB")
         if type(self.aoa_start) is not bool or (self.aoa_start and self.transport != "usb"):
             raise ValueError("AOA start is an explicit USB-only option")
-        if self.profile not in ("v1", "v2", "honda-v2"):
-            raise ValueError("Choose the v1 or v2 test profile")
+        if self.profile not in ("v1", "v2", "honda-v2", *VERSIONS, *ACCESSORIES, "hicar"):
+            raise ValueError("Unknown CarLife protocol profile")
+        if self.profile in VERSIONS and any(not isinstance(s, str) or len(s) > 128 or
+                (s and not s.isprintable()) for s in (self.oem_channel, self.cuid)):
+            raise ValueError("Канал и CUID CarLife должны содержать до 128 печатных символов")
         if any(type(v) is not int for v in (self.width, self.height, self.fps)) or not (
                 64 <= self.width <= 4096 and 64 <= self.height <= 4096 and 1 <= self.fps <= 60):
             raise ValueError("Projection mode must be 64..4096 pixels and 1..60 FPS")
         if self.trace_mode not in ("sampled", "full"):
             raise ValueError("Unknown trace mode")
         profile_name(self.touch_profile)
-        if self.transport in ("tcp", "wifi"):
+        if family != "carlife" and self.transport in ("wifi", "ncm"):
+            from ipaddress import IPv4Address
+            addr = IPv4Address(self.host)
+            if addr.is_multicast or addr.is_unspecified or not 1 <= self.prefix_length <= 32:
+                raise ValueError("Выберите локальный IPv4-адрес сетевого интерфейса")
+        if self.transport in ("tcp", "wifi", "ncm"):
             if not isinstance(self.host, str) or not self.host.strip() or any(c.isspace() for c in self.host):
                 raise ValueError("Enter a TCP hostname or IP address, without a URL scheme or spaces")
             if "://" in self.host or "/" in self.host or "\x00" in self.host:
@@ -302,6 +324,73 @@ class DesktopV2Client(_DesktopControls, HondaReferenceClient):
     pass
 
 
+class AuthenticatedClient(DesktopV2Client):
+    pre_version_status_packets = 0
+
+    def _heartbeat_due(self):
+        return self.session.state in ('WAIT_AUTH', 'WAIT_INIT', 'STREAMING', 'PAUSED')
+
+    def _record_wire(self, direction, packet, wire=None):
+        # MD_INFO may contain an OEM token. Keep packet boundaries in the event
+        # log but omit the raw byte streams for the whole authenticated session.
+        self.trace.packet(direction, packet)
+
+    def _check_native_handshake_deadline(self):
+        self.session.check_deadline()
+        try:
+            super()._check_native_handshake_deadline()
+        except ProtocolError as error:
+            if self.session.state == 'WAIT_VERSION' and self.pre_version_status_packets:
+                raise ProtocolError('Телефон присылает статус прежнего USB-сеанса. Для смены версии в HSD '
+                                    'остановите подключение на телефоне, нажмите «Подключить» и повторите на ГУ.') from error
+            raise
+
+    def send(self, packet):
+        with self.state_lock:
+            super().send(self.session.crypto.transform(packet, outbound=True))
+
+    def _receive_packet(self, packet, video, received_ns=None):
+        with self.state_lock:
+            try:
+                if (self.backend == 'DIRECT_USB_AOA' and self.session.state == 'WAIT_VERSION' and
+                        packet.message in (MODULE_STATUS, NAVI_NEXT_TURN_INFO, MEDIA_INFO, MEDIA_PROGRESS_BAR, SUBSCRIBE_DONE)):
+                    # HSD can leave the last session's module/cluster notifications
+                    # beside its final audio packets on a still attached accessory.
+                    self._check_native_handshake_deadline()
+                    self.pre_version_status_packets += 1
+                    if self.pre_version_status_packets > 64:
+                        raise ProtocolError('USB: слишком много сообщений до согласования версии CarLife')
+                    return
+                packet = self.session.crypto.transform(packet, outbound=False)
+                return super()._receive_packet(packet, video, received_ns)
+            except AuthError as error:
+                self.session.state = 'BLOCKED_AUTH'
+                self.session.failure_reason = f'{type(error).__name__}: {error}'
+                if error.reply is not None:
+                    # The reader closes the transport on failure. Write the
+                    # negative verdict before handing the exception to it.
+                    try:
+                        self._write_packet(self.session.crypto.transform(error.reply, outbound=True))
+                    except (OSError, USBError, ProtocolError) as delivery_error:
+                        # Some phones close immediately after their verdict.
+                        self.trace.event('auth_reply_failed', message=error.reply.message,
+                                         error_type=type(delivery_error).__name__)
+                raise
+
+    def set_night_mode(self, night):
+        with self.state_lock:
+            self.session.theme = int(night)
+            if self.session.state in ('STREAMING', 'PAUSED'):
+                for command in self.session.theme_commands():
+                    self.send(command)
+
+    def summary(self):
+        result = super().summary()
+        result['carlife_negotiation'] = self.session.status()
+        result['carlife_negotiation']['previous_usb_status_packets'] = self.pre_version_status_packets
+        return result
+
+
 def create_client(config, output_dir, audio_sink=None, on_decoded_frame=None, on_frame_available=None, *,
                   on_claim_wait=None, cancel=None):
     """Construct (do not connect) a normal HUClient for the desktop worker.
@@ -312,8 +401,23 @@ def create_client(config, output_dir, audio_sink=None, on_decoded_frame=None, on
     """
     config.validate()
     usb = config.transport == "usb"
+    if config.profile in (*ACCESSORIES, "hicar"):
+        factory = None
+        if usb:
+            factory = (ExplicitAOATransportFactory(config.usb_identity, output_dir, strings=ACCESSORIES[config.profile],
+                        on_claim_wait=on_claim_wait, cancel=cancel) if config.aoa_start else
+                       AccessoryTransportFactory(config.usb_identity, on_claim_wait=on_claim_wait, cancel=cancel))
+        return ReceiverClient(config, output_dir, audio_sink, on_frame_available, on_decoded_frame, factory)
     v2 = config.profile in ("v2", "honda-v2")
     client_type = DesktopV2Client if v2 else DesktopClient
+    session_factory = DesktopV2Session if v2 else DesktopV1Session
+    modern = config.profile in VERSIONS
+    if modern:
+        client_type = AuthenticatedClient
+        session_factory = partial(ModernSession, version=VERSIONS[config.profile], channel=config.oem_channel,
+                                  cuid=config.cuid or uuid.uuid4().hex, multitouch=profile_name(config.touch_profile) != 'LEGACY_SINGLE',
+                                  theme=int(config.night_mode), require_encryption=config.require_encryption,
+                                  registration=load_oem_registration(config.registration_file, config.oem_channel))
     transport_factory = None
     if usb:
         if config.aoa_start:
@@ -324,11 +428,12 @@ def create_client(config, output_dir, audio_sink=None, on_decoded_frame=None, on
                                                           cancel=cancel)
     elif config.transport == "wifi":
         from .wireless import TCP6Stream
-        transport_factory = lambda: TCP6Stream.connect(config.host)
+        transport_factory = (lambda: TCP6Stream.connect(config.host, try_update=True)) if modern else (
+            lambda: TCP6Stream.connect(config.host))
     return client_type(config.host, config.port, output_dir, config.width, config.height, config.fps,
                        backend="DIRECT_USB_AOA" if usb else "TCP6_WIFI" if config.transport == "wifi" else "TCP_STREAM",
                        transport_factory=transport_factory,
-                       session_factory=DesktopV2Session if v2 else DesktopV1Session,
+                       session_factory=session_factory,
                        touch_profile=config.touch_profile, trace_mode=config.trace_mode,
                        allow_mode_fallback=config.allow_mode_fallback,
                        audio_capture=config.audio_capture, on_decoded_frame=on_decoded_frame,

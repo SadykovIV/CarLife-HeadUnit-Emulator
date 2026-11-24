@@ -44,7 +44,7 @@ void mainCRTStartup(void) {
     append(command, used, tail);
     startup.cb = sizeof(startup);
     if (!CreateProcessW(executable, command, 0, 0, 0, 0, 0, base, &startup, &child)) {
-        MessageBoxW(0, L"Cannot start bundled Python. Extract the complete ZIP archive, then run CarLifeHeadUnitEmulator.exe.", L"CarLife HeadUnit Emulator", 0x10);
+        MessageBoxW(0, L"Cannot start bundled Python. Extract the complete ZIP archive, then run HSDHeadUnitEmulator.exe.", L"HSD HeadUnit Emulator", 0x10);
         ExitProcess(1);
     }
     CloseHandle(child.thread);

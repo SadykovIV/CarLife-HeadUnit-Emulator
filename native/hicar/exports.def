@@ -1,0 +1,10 @@
+LIBRARY hsd_hicar_auth
+EXPORTS
+    carlink_abi_size
+    hks_register_file_callbacks
+    hks_register_get_hardware_udid_callback
+    get_instance
+    destroy
+    receive_data
+    start_pake
+    authenticate_peer

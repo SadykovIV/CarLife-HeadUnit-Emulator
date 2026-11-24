@@ -5,6 +5,7 @@ interoperability evidence. The server owns one loopback listener and one peer.
 """
 from fractions import Fraction
 import errno
+import hashlib
 import math
 import socket
 import struct
@@ -16,6 +17,7 @@ from .protocol import (Packet, FrameParser, CMD, VIDEO, MEDIA, TOUCH, HU_VERSION
 from .cluster import (MEDIA_INFO, MEDIA_PROGRESS_BAR, MODULE_STATUS, NAVI_NEXT_TURN_INFO,
                       SUBSCRIBE, SUBSCRIBE_DONE, SUBSCRIBE_START, SUBSCRIBE_STOP)
 from .honda_reference import list_body, repeated_entries
+from .modern import SET_THEME, GET_THEME, MD_THEME, HU_CHALLENGE, MD_PROOF, MD_AUTHEN_RESULT, STATISTIC_INFO
 
 
 class DemoCluster:
@@ -176,6 +178,8 @@ class DemoPeer:
         pcm_index = 0
         cluster = DemoCluster()
         version = 1
+        modern = False
+        theme = 0
         font = ImageFont.load_default(size=28)
         small_font = ImageFont.load_default(size=18)
         def configure(reset_pts=True):
@@ -207,11 +211,24 @@ class DemoPeer:
                         self._send(*replies)
                     continue
                 if p.message == HU_VERSION:
-                    version = fields(p.payload).get(1, 1)
+                    version_info = fields(p.payload)
+                    version = version_info.get(1, 1)
+                    modern = (version, version_info.get(2, 0)) >= (2, 1)
                     self._send(Packet(CMD, VERSION_MATCH, protobuf(f1=1)),
-                               Packet(CMD, MD_INFO, protobuf(f4='Local synthetic MD', f15=MEDIACODEC_AU_MARKER)))
-                    if version == 2:
+                               Packet(CMD, MD_INFO, protobuf(f4='Local synthetic MD', f14='Demo', f20='35',
+                                                            f15=MEDIACODEC_AU_MARKER)))
+                    if version >= 2:
                         self._send(Packet(CMD, 0x10051))
+                elif modern and p.message == STATISTIC_INFO:
+                    self._send(Packet(CMD, MD_AUTHEN_RESULT, protobuf(f1=1)))
+                elif modern and p.message == HU_CHALLENGE:
+                    nonce = fields(p.payload)[1].split(b';')[1]
+                    digest = hashlib.md5(b'CARLIFELocal synthetic MDDemo35' + nonce, usedforsecurity=False)
+                    self._send(Packet(CMD, MD_PROOF, protobuf(f1=digest.hexdigest())))
+                elif modern and p.message == SET_THEME:
+                    theme = fields(p.payload)[1]
+                elif modern and p.message == GET_THEME:
+                    self._send(Packet(CMD, MD_THEME, protobuf(f1=theme)))
                 elif p.message == VIDEO_INIT:
                     mode = fields(p.payload)
                     width, height, fps = mode[1], mode[2], mode[3] or 30
@@ -226,7 +243,7 @@ class DemoPeer:
                 elif p.message == VIDEO_PAUSE:
                     streaming = False
                     self._send(Packet(MEDIA, 0x30003))
-                elif p.message == VIDEO_RESET and version == 2:
+                elif p.message == VIDEO_RESET and version >= 2:
                     configure(reset_pts=False)
                 elif p.channel == TOUCH:
                     if p.message in (TOUCH_ACTION, ACTION3):

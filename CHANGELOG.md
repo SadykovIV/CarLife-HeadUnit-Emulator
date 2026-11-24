@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.0 · 24 November 2026
+
+- The app is now **HSD HeadUnit Emulator** on macOS and Windows. Existing settings and reports open from their original location.
+- Choose CarLife, CarbitLink, WeLink or Huawei HiCar in the main window. CarbitLink supports Wi-Fi discovery and the USB accessory, WeLink A1 supports USB, and wired HiCar negotiates a paired session over an existing NCM network interface.
+- All three receivers display H.264 and return touch input. WeLink plays PCM and HiCar plays AAC. CarbitLink leaves audio on the phone’s Bluetooth route.
+- The Windows ZIP includes Zadig 2.9 with offline WinUSB support. The driver shortcut opens the setup for the selected USB transport and explains CDC-NCM for wired HiCar.
+- Select a CarLife HU protocol version under **Приборка и HUD**. The authenticated profiles wait for both the phone's challenge response and its verdict on the HU before starting video. The JSON report exposes both decisions.
+- Negotiate SDK-compatible RSA/AES content encryption when required. A provisioned HU can also send its own registration and certificate for OEM activation.
+- Report multitouch capability, synchronize the phone's day/night mode and connect the optional seventh Wi-Fi channel when available.
+- Preserve the phone's final authorization message when another Wi-Fi channel closes at the same time.
+
 ## [0.5.1](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/tag/v0.5.1) — 2026-11-13, updated 2026-11-14
 
 - Connect to a compatible phone over Wi-Fi. Put both devices on the same network or use the phone hotspot, then discover the phone or enter its IP address.

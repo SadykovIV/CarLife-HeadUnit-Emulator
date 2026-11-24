@@ -13,7 +13,14 @@
     "url": "https://www.python.org/ftp/python/3.13.16/python-3.13.16-embed-amd64.zip",
     "sha256": "97dae5274cc54867065e8d5a3226e48c35017ed332a0fdb0e27d5b5821961297"
   },
+  "driver_kit": {
+    "installer": {"version":"2.9","filename":"zadig-2.9.exe","sha256":"4ecaa95df3da3621486a043aef8b3050b8bafe7c901402871e816229ef82039b","url":"https://github.com/pbatard/libwdi/releases/download/v1.5.1/zadig-2.9.exe"},
+    "source": {"version":"1.5.1","filename":"libwdi-1.5.1-source.zip","sha256":"746547aaf927cae44c75512d763941805928427f4ba4df3dbb40c3f7f561821e","url":"https://codeload.github.com/pbatard/libwdi/zip/refs/tags/v1.5.1"}
+  },
   "wheels": [
+    {"name":"cryptography","version":"50.0.2","filename":"cryptography-50.0.2-cp311-abi3-win_amd64.whl","sha256":"7afa5a6602a9f29af1f3a2965f831bae7c9d5d597b7cbb716d41ab3b7d89879c","url":"https://files.pythonhosted.org/packages/9a/4f/adfc442765721292fff86d314ce385d3249d22db42295c0dd057727b60f3/cryptography-50.0.2-cp311-abi3-win_amd64.whl"},
+    {"name":"cffi","version":"2.1.1","filename":"cffi-2.1.1-cp313-cp313-win_amd64.whl","sha256":"1aa5645c30469b09530c4ebca77ebf8f17618293c58f8549cb1a543a50236e7d","url":"https://files.pythonhosted.org/packages/60/a6/8b149b2c3f2e11aaa1618ef64500b45f50f22c57a977a4dff1aff1f91042/cffi-2.1.1-cp313-cp313-win_amd64.whl"},
+    {"name":"pycparser","version":"3.11","filename":"pycparser-3.11-py3-none-any.whl","sha256":"51d5a8ba2be0bbe440b99d2112604c95bbbc3c2748a64260186c541e1729cd80","url":"https://files.pythonhosted.org/packages/90/11/0e6f11117525ff0eec40ebac3d313376f102df93ca44ad9e893ee85e4f89/pycparser-3.11-py3-none-any.whl"},
     {"name":"PySide6","version":"6.12.0","filename":"pyside6-6.12.0-cp310-abi3-win_amd64.whl","sha256":"31a8d2893f2f28ab483b1534dde0438f27af6e234593de30425cb4729052d8f8","url":"https://files.pythonhosted.org/packages/a1/da/8e8514fc29ea916c3cd71a524480b77409e19ed12d709e8a5d73be089b81/pyside6-6.12.0-cp310-abi3-win_amd64.whl"},
     {"name":"PySide6_Essentials","version":"6.12.0","filename":"pyside6_essentials-6.12.0-cp310-abi3-win_amd64.whl","sha256":"c9a95102aa23c1f86516a30d5a9be37552d324eee7e567eb7508973f1218cb42","url":"https://files.pythonhosted.org/packages/03/61/9a7e32a37b224f68506785bfb0f288d516098ec71681782d72b695a6c95d/pyside6_essentials-6.12.0-cp310-abi3-win_amd64.whl"},
     {"name":"PySide6_Addons","version":"6.12.0","filename":"pyside6_addons-6.12.0-cp310-abi3-win_amd64.whl","sha256":"98d8d62010da6605344cee83e5c96fb846170a1f2d924523f10f5d92078b02b0","url":"https://files.pythonhosted.org/packages/02/41/ba3d52fe2acd942ebf71eb02b3bdf0897f7f6f4ce8f52289cb50228e48d3/pyside6_addons-6.12.0-cp310-abi3-win_amd64.whl"},

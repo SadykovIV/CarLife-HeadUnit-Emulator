@@ -15,10 +15,10 @@ import struct
 import threading
 import time
 
-from .protocol import CMD, TOUCH, VIDEO, VIDEO_HEARTBEAT, MAX_INNER, FrameParser, Packet, ProtocolError
+from .protocol import CMD, TOUCH, UPDATE, VIDEO, VIDEO_HEARTBEAT, MAX_INNER, FrameParser, Packet, ProtocolError
 
 CHANNEL_PORTS = {1: 7240, 2: 8240, 3: 9240, 4: 9241, 5: 9242, 6: 9340}
-CHANNEL_NAMES = {1: "CMD", 2: "VIDEO", 3: "MEDIA", 4: "TTS", 5: "VR", 6: "TOUCH"}
+CHANNEL_NAMES = {1: "CMD", 2: "VIDEO", 3: "MEDIA", 4: "TTS", 5: "VR", 6: "TOUCH", UPDATE: "UPDATE"}
 BEACON_PORT = 7999
 PROBE_PORT = 8999
 BEACON = b"CarlifeHost"
@@ -39,7 +39,7 @@ class WirelessConnectionError(ConnectionError):
 class InnerChannelParser:
     """Incremental, bounded parser for one native TCP channel."""
     def __init__(self, channel):
-        if channel not in CHANNEL_PORTS:
+        if channel not in CHANNEL_NAMES:
             raise ValueError("unknown CarLife channel")
         self.channel = channel
         self.buffer = bytearray()
@@ -84,7 +84,7 @@ class InnerChannelParser:
 class TCP6Stream:
     """One reader, one writer, six sockets; loss of any channel ends the session."""
     def __init__(self, sockets, host):
-        if set(sockets) != set(CHANNEL_PORTS):
+        if set(sockets) not in (set(CHANNEL_PORTS), set(CHANNEL_NAMES)):
             raise ValueError("all six CarLife sockets are required")
         self.sockets = dict(sockets)
         self.channels = {sock: channel for channel, sock in sockets.items()}
@@ -92,6 +92,7 @@ class TCP6Stream:
         self.outbound = FrameParser()
         self.ready = deque()
         self.pending = bytearray()
+        self.peer_eof = None
         self.closed = threading.Event()
         self.close_lock = threading.Lock()
         self.failure_reason = None
@@ -100,11 +101,12 @@ class TCP6Stream:
         self.evidence = dict(backend="TCP6_WIFI", host=host, wire="native_inner_per_channel",
             channels={CHANNEL_NAMES[c]: s.getpeername()[1] for c, s in sockets.items()},
             peer=sockets[CMD].getpeername()[0], local_ip=sockets[CMD].getsockname()[0],
-            connected_channels=6, adb_data_plane=False)
+            connected_channels=len(sockets), adb_data_plane=False)
 
     @classmethod
-    def connect(cls, host, timeout=6.0, ports=None):
+    def connect(cls, host, timeout=6.0, ports=None, *, try_update=False):
         ports = dict(CHANNEL_PORTS if ports is None else ports)
+        update_port = ports.pop(UPDATE, 9440) if try_update else None
         if set(ports) != set(CHANNEL_PORTS):
             raise ValueError("all six CarLife ports are required")
         sockets = {}
@@ -133,6 +135,17 @@ class TCP6Stream:
                 sock.connect((target[0], port, *target[2:]))
                 connected.append(CHANNEL_NAMES[channel])
                 local = sock.getsockname()
+            if try_update:
+                # Some Android MDs only implement the six projection services.
+                # Use the same address/interface for the SDK's optional UPDATE socket.
+                extra = socket.socket(family, socktype, proto)
+                try:
+                    extra.settimeout(.4)
+                    extra.bind((local[0], 0, *local[2:]))
+                    extra.connect((target[0], update_port, *target[2:]))
+                    sockets[UPDATE] = extra
+                except OSError:
+                    extra.close()
             result = cls(sockets, host)
             result.settimeout(.5)
             return result
@@ -179,6 +192,10 @@ class TCP6Stream:
                 if self.ready:
                     self.pending.extend(self.ready.popleft())
                     break
+                if self.peer_eof is not None:
+                    channel = self.peer_eof
+                    self.parsers[channel].eof()
+                    raise ConnectionError(f"Wi-Fi: канал {CHANNEL_NAMES[channel]} закрыт телефоном")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise socket.timeout("Wi-Fi receive timeout")
@@ -190,11 +207,13 @@ class TCP6Stream:
                 for sock in readable:
                     channel = self.channels[sock]
                     data = sock.recv(65536)
-                    if not data:
-                        self.parsers[channel].eof()
-                        raise ConnectionError(f"Wi-Fi: канал {CHANNEL_NAMES[channel]} закрыт телефоном")
-                    self.rx_bytes += len(data)
-                    self.ready.extend(self.parsers[channel].feed(data))
+                    if data:
+                        self.rx_bytes += len(data)
+                        self.ready.extend(self.parsers[channel].feed(data))
+                    elif self.peer_eof is None:
+                        # A final authorization verdict on CMD can arrive with an EOF on VIDEO.
+                        # Drain this batch of complete packets before reporting the disconnect.
+                        self.peer_eof = channel
             data = bytes(self.pending[:size])
             del self.pending[:size]
             return data

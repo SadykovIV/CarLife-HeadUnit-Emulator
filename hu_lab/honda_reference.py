@@ -12,7 +12,7 @@ CARLIFE_SUBSCRIBE,CARLIFE_SUBSCRIBE_DONE=0x18043,0x10044
 FEATURES=('BLUETOOTH_AUTO_PAIR','BLUETOOTH_INTERNAL_UI','FOCUS_UI','VOICE_WAKEUP')
 
 
-def repeated_entries(body):
+def repeated_entries(body, key_type=int):
     """Bounded proto repeated field2 reader; preserve every requested module ID."""
     if len(body)>65535: raise ProtocolError('reference list too large')
     pos=0;entries=[];count=None
@@ -40,7 +40,7 @@ def repeated_entries(body):
             value=body[pos:pos+size];pos+=size
             if field==2:entries.append(fields(value))
         else:raise ProtocolError('unsupported reference list wire type')
-    if count!=len(entries) or len(entries)>32 or any(not isinstance(e.get(1),int) for e in entries):
+    if count!=len(entries) or len(entries)>32 or any(not isinstance(e.get(1),key_type) for e in entries):
         raise ProtocolError('reference list count or moduleID mismatch')
     return entries
 

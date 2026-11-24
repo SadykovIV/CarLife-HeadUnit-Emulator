@@ -10,6 +10,7 @@ import platform
 import sys
 import threading
 import time
+import uuid
 
 from PySide6.QtCore import Qt, QEvent, QPointF, QRectF, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QImage, QEventPoint, QInputDevice, QKeySequence, QPainter, QPalette, QPixmap, QTransform
@@ -19,7 +20,11 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBo
     QSpinBox, QSplitter, QTabBar, QStackedWidget, QVBoxLayout, QWidget)
 from .desktop_audio import DesktopAudioPlayer
 from .desktop_cluster import ClusterPage
+from . import __version__ as VERSION
 from .desktop_session import DesktopConfig, create_client, list_usb_devices
+from .modern import VERSIONS
+from .receiver import FAMILIES, MODES
+from .receiver_discovery import interfaces
 from .wireless import discover_phones
 from .desktop_demo import DemoPeer
 from .desktop_input import DesktopInputArbiter, DesktopTouchInput, contact_limit
@@ -32,9 +37,6 @@ from .usb import USBError, USBIdentity
 from .windows_driver_setup import inspect_setup, apply_setup
 from .frame_wake import FrameWake
 from .macos_activity import UserInitiatedActivity
-
-VERSION = "0.5.1"
-
 
 DESKTOP_PROFILE = 'honda-v2'
 
@@ -50,8 +52,8 @@ def _usb_label(identity):
 
 
 def _owner_hint(owner):
-    if owner == 'CarLife HeadUnit Emulator':
-        return 'Порт USB занят другим сеансом CarLife HeadUnit Emulator. Нажмите «Отключить» в его окне.'
+    if owner == 'HSD HeadUnit Emulator':
+        return 'Порт USB занят другим сеансом HSD HeadUnit Emulator. Нажмите «Отключить» в его окне.'
     if owner.rsplit(', ', 1)[-1] == 'livi-helperd':
         return 'Интерфейс CarLife занят LIVI (livi-helperd). Завершите LIVI через ⌘Q.'
     return f'Интерфейс CarLife занят: {owner}. Освободите USB-подключение в этом приложении.'
@@ -64,6 +66,7 @@ class _ConnectionAttemptFailed(Exception):
         detail = report['connection_failure']
         stage = detail['stage']
         message = report['error']
+        protocol = FAMILIES.get(report.get('profile'), 'CarLife')
         issue = detail.get('selection_reason')
         if detail.get('claim_owner'):
             message = _owner_hint(detail['claim_owner']) + ' Затем нажмите «Подключить».'
@@ -73,10 +76,10 @@ class _ConnectionAttemptFailed(Exception):
         elif detail.get('reason') == 'cancelled':
             message = 'Подключение отменено.'
         elif issue == 'adb_only':
-            message = ('Через WinUSB доступен только ADB. Для CarLife нужен отдельный '
+            message = (f'Через WinUSB доступен только ADB. Для {protocol} нужен отдельный '
                        'интерфейс аксессуара 0 с драйвером WinUSB.')
         elif issue in ('no_winusb', 'no_verified_accessory'):
-            message = ('Windows не предоставила доступный WinUSB-интерфейс CarLife с нужными '
+            message = (f'Windows не предоставила доступный WinUSB-интерфейс {protocol} с нужными '
                        'каналами. Подробности — в отчёте этой попытки.')
         elif issue == 'cannot_open':
             message = 'Не удалось открыть интерфейс WinUSB выбранного устройства. Код Windows — в отчёте.'
@@ -107,6 +110,8 @@ class _ConnectionAttemptFailed(Exception):
         selection = (detail.get('windows_selection') or {}).get('target') or detail.get('selected_identity') or {}
         if issue in ('adb_only', 'no_winusb', 'no_verified_accessory') and selection.get('pid') == 0x2d01:
             message += ' Откройте «Приборка и HUD» → «Настроить WinUSB…».'
+        elif issue in ('no_winusb', 'no_verified_accessory') and selection.get('pid') == 0x2d00:
+            message += ' Откройте «Драйверы USB» → «Папка Drivers» для настройки аксессуара 18D1:2D00.'
         super().__init__(message)
 
 
@@ -204,7 +209,7 @@ class VideoSurface(QWidget):
             self.transform = None
             painter.setPen(QColor('#657c90'))
             painter.drawText(self.rect(), Qt.AlignCenter,
-                'CarLife HeadUnit Emulator\n\nВыберите устройство сверху и нажмите «Подключить»\n\nЭкран · Звук · Управление')
+                'HSD HeadUnit Emulator\n\nВыберите устройство сверху и нажмите «Подключить»\n\nЭкран · Звук · Управление')
 
     def cancel(self, reason):
         self.input_arbiter.cancel()
@@ -534,8 +539,8 @@ class HeadUnitWindow(QMainWindow):
         self.gesture_frames = []
         self.gesture_due = 0
         self.audio = DesktopAudioPlayer()
-        self.activity = UserInitiatedActivity('CarLife video and input session')
-        self.setWindowTitle(f'CarLife HeadUnit Emulator {VERSION}')
+        self.activity = UserInitiatedActivity('HSD HeadUnit projection session')
+        self.setWindowTitle(f'HSD HeadUnit Emulator {VERSION}')
         self.resize(1360, 900)
         self.setMinimumSize(1060, 680)
         self.theme_variant = 'dark'
@@ -561,10 +566,16 @@ class HeadUnitWindow(QMainWindow):
         bar.addWidget(badge)
         titles = QVBoxLayout()
         titles.setSpacing(3)
-        titles.addWidget(label('CarLife HeadUnit Emulator', 'brand'))
+        titles.addWidget(label('HSD HeadUnit Emulator', 'brand'))
         system = 'macOS arm64' if sys.platform == 'darwin' else 'Windows x64' if sys.platform == 'win32' else platform.system()
         titles.addWidget(label(f'{VERSION} · {system}', 'muted'))
         bar.addLayout(titles)
+        self.family = QComboBox()
+        for value, title in FAMILIES.items():
+            self.family.addItem(title, value)
+        self.family.setAccessibleName('Протокол проекции')
+        self.family.setToolTip('Протокол проекции телефона')
+        bar.addWidget(self.family)
         self.transport = QComboBox()
         for text, value in [('USB', 'usb'), ('Wi-Fi', 'wifi'), ('TCP', 'tcp'), ('Демо', 'demo')]:
             self.transport.addItem(text, value)
@@ -608,6 +619,15 @@ class HeadUnitWindow(QMainWindow):
         self.wifi_scan.setToolTip('Искать телефоны CarLife в общей сети в течение 5 секунд')
         wifi_bar.addWidget(self.wifi_scan)
         bar.addWidget(self.wifi_group, 1)
+        self.local_interface = QComboBox()
+        self.local_interface.setAccessibleName('Сетевой интерфейс компьютера')
+        self.local_interface.setToolTip('Локальный адрес компьютера. Для HiCar выберите USB-сеть телефона.')
+        self.local_group = QWidget()
+        local_layout = QHBoxLayout(self.local_group)
+        local_layout.setContentsMargins(0, 0, 0, 0)
+        local_layout.addWidget(self.local_interface, 1)
+        local_layout.addWidget(button('↻', self.refresh_interfaces))
+        bar.addWidget(self.local_group, 1)
         self.demo_header = label('Встроенное устройство · без USB', 'muted')
         bar.addWidget(self.demo_header, 1)
         self.connect_button = button('Подключить', self.connect_session, True)
@@ -628,6 +648,8 @@ class HeadUnitWindow(QMainWindow):
         self.tabs.addTab('Экран')
         navigation.addWidget(self.tabs)
         navigation.addStretch()
+        self.driver_shortcut = button('Драйверы USB', self.show_windows_drivers)
+        navigation.addWidget(self.driver_shortcut)
         self.sound_enabled = QCheckBox('Звук')
         self.sound_enabled.setChecked(True)
         self.sound_enabled.setFixedWidth(80)
@@ -659,6 +681,7 @@ class HeadUnitWindow(QMainWindow):
         for text, action in [('⌂  Домой','home'), ('←  Назад','back'), ('◀◀','previous'), ('▶','play'), ('■','stop'), ('▶▶','next')]:
             b = button(text, lambda checked=False, a=action: self.control(a))
             b.setToolTip({'play':'Воспроизведение','stop':'Остановка','previous':'Предыдущий трек','next':'Следующий трек'}.get(action, text))
+            b.setProperty('hardKey', action)
             controls.addWidget(b)
             self.stream_buttons.append(b)
         controls.addStretch()
@@ -718,6 +741,7 @@ class HeadUnitWindow(QMainWindow):
         self.setCentralWidget(root)
         self.frame_wake = FrameWake(self.refresh_frame, self)
         self.tabs.currentChanged.connect(self.tab_changed)
+        self.family.currentIndexChanged.connect(self.family_changed)
         self.transport.currentIndexChanged.connect(self.transport_changed)
         self.header_volume.valueChanged.connect(self.volume.setValue)
         self.volume.valueChanged.connect(self.header_volume.setValue)
@@ -726,6 +750,7 @@ class HeadUnitWindow(QMainWindow):
         self.theme.currentIndexChanged.connect(self.apply_theme)
         QApplication.instance().styleHints().colorSchemeChanged.connect(self.apply_theme)
         self.setup_menu()
+        self.refresh_interfaces()
         self.load_settings()
         self.apply_theme()
         self.refresh_audio()
@@ -736,7 +761,7 @@ class HeadUnitWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(33)
-        self.log_event('Готово. Подключение USB автоматически включает AOA для выбранного устройства.')
+        self.log_event('Готово. Выберите протокол проекции и способ подключения.')
         QTimer.singleShot(0, self.refresh_usb)
 
     def apply_theme(self, *_):
@@ -756,6 +781,8 @@ class HeadUnitWindow(QMainWindow):
         self.setPalette(palette)
         self.setStyleSheet(stylesheet(choice))
         self.video.update()
+        if hasattr(self.client, 'set_night_mode'):
+            self.invoke(lambda: self.client.set_night_mode(choice == 'dark'))
 
     def tab_changed(self, index):
         self.cancel_typing()
@@ -770,6 +797,7 @@ class HeadUnitWindow(QMainWindow):
     def start_cluster_demo(self):
         if self.closing or self.busy or self.client:
             return
+        self.family.setCurrentIndex(self.family.findData('carlife'))
         self.transport.setCurrentIndex(self.transport.findData('demo'))
         self.connect_session()
 
@@ -795,13 +823,48 @@ class HeadUnitWindow(QMainWindow):
         self.hud_tab_index = self.tabs.count() - 1
         self.cluster = ClusterPage(self.start_cluster_demo)
         layout.addWidget(self.cluster)
+        protocol_box = self.carlife_options = QGroupBox('Протокол CarLife')
+        form = QFormLayout(protocol_box)
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        self.protocol_profile = QComboBox()
+        self.protocol_profile.addItem('CarLife 2.0 · Honda', DESKTOP_PROFILE)
+        for key, (major, minor) in VERSIONS.items():
+            self.protocol_profile.addItem(f'CarLife {major}.{minor} · с авторизацией', key)
+        form.addRow('Версия ГУ', self.protocol_profile)
+        self.oem_channel = QLineEdit()
+        self.oem_channel.setPlaceholderText('Если выдан Baidu')
+        self.oem_channel.setMaxLength(128)
+        self.cuid = QLineEdit(uuid.uuid4().hex)
+        self.cuid.setMaxLength(128)
+        self.cuid.setToolTip('Идентификатор этой установки. Можно указать CUID своего ГУ.')
+        form.addRow('Канал OEM', self.oem_channel)
+        form.addRow('CUID', self.cuid)
+        self.require_encryption = QCheckBox('Требовать шифрование RSA/AES')
+        form.addRow(self.require_encryption)
+        registration_row = QWidget()
+        row = QHBoxLayout(registration_row)
+        row.setContentsMargins(0, 0, 0, 0)
+        self.registration_file = QLineEdit()
+        self.registration_file.setPlaceholderText('Необязательно')
+        self.registration_file.setClearButtonEnabled(True)
+        row.addWidget(self.registration_file)
+        row.addWidget(button('Обзор…', self.choose_registration))
+        form.addRow('Файл активации OEM', registration_row)
+        def update_identity_fields():
+            modern = self.protocol_profile.currentData() in VERSIONS
+            for field in (self.oem_channel, self.cuid, self.require_encryption, registration_row):
+                form.setRowVisible(field, modern)
+        self.protocol_profile.currentIndexChanged.connect(update_identity_fields)
+        update_identity_fields()
+        layout.addWidget(protocol_box)
         self.driver_group = QGroupBox('Драйвер Windows')
         driver_box = QVBoxLayout(self.driver_group)
-        self.driver_status = label('Если Windows видит только ADB, проверьте настройку интерфейса CarLife.', 'muted', True)
+        self.driver_status = label('', 'muted', True)
         driver_box.addWidget(self.driver_status)
         self.driver_button = button('Настроить WinUSB…', self.setup_windows_driver)
         driver_box.addWidget(self.driver_button)
-        self.driver_group.setVisible(_windows_driver_ui() and self.transport.currentData() == 'usb')
+        self.driver_files = button('Папка Drivers', self.open_driver_files)
+        driver_box.addWidget(self.driver_files)
         layout.addWidget(self.driver_group)
         self.demo_group = QGroupBox('Встроенный тест')
         box = QVBoxLayout(self.demo_group)
@@ -813,6 +876,11 @@ class HeadUnitWindow(QMainWindow):
         self.reconnect_button = button('Переподключить', self.reconnect_session)
         layout.addWidget(self.reconnect_button)
         layout.addStretch()
+
+    def choose_registration(self):
+        path, _ = QFileDialog.getOpenFileName(self, 'Регистрация вашего ГУ', '', 'CarLife OEM (*.json)')
+        if path:
+            self.registration_file.setText(path)
 
     def display_tab(self):
         layout = self.tab('Видео')
@@ -1041,17 +1109,77 @@ class HeadUnitWindow(QMainWindow):
         self.refresh_buttons()
         self.pending.append((self.executor.submit(work), done, on_error))
 
+    def refresh_interfaces(self):
+        previous = self.local_interface.currentData()
+        self.local_interface.clear()
+        entries = sorted(interfaces(), key=lambda row: row[0].startswith('127.'))
+        for address, prefix, name in entries:
+            if 1 <= prefix <= 32:
+                self.local_interface.addItem(f'{name} · {address}', address)
+                self.local_interface.setItemData(self.local_interface.count()-1, prefix, Qt.UserRole+1)
+        if self.local_interface.findData(previous) >= 0:
+            self.local_interface.setCurrentIndex(self.local_interface.findData(previous))
+
+    def family_changed(self):
+        family = self.family.currentData()
+        current = self.transport.currentData()
+        labels = {'usb':'USB', 'wifi':'Wi-Fi', 'tcp':'TCP', 'demo':'Демо', 'ncm':'USB NCM'}
+        self.transport.blockSignals(True)
+        self.transport.clear()
+        for mode in MODES[family]:
+            self.transport.addItem(labels[mode], mode)
+        if current in MODES[family] and family == 'carlife':
+            self.transport.setCurrentIndex(self.transport.findData(current))
+        self.transport.blockSignals(False)
+        self.carlife_options.setVisible(family == 'carlife')
+        self.transport_changed()
+
     def transport_changed(self):
         if not hasattr(self, 'tcp_group'): return
         kind = self.transport.currentData()
         self.usb_group.setVisible(kind == 'usb')
         self.tcp_group.setVisible(kind == 'tcp')
-        self.wifi_group.setVisible(kind == 'wifi')
-        self.wifi_hint.setVisible(kind == 'wifi')
+        family = self.family.currentData()
+        listen = (family, kind) in (('carbit','wifi'), ('hicar','ncm'))
+        self.local_group.setVisible(listen)
+        self.wifi_group.setVisible(kind == 'wifi' and family == 'carlife')
+        self.wifi_hint.setVisible(kind in ('wifi', 'ncm') or family == 'welink')
+        hints = {
+            'carlife': 'Подключите компьютер и телефон к одной сети. В HeadSwap выберите Wi-Fi и нажмите «Подключить», затем найдите телефон здесь.',
+            'carbit': 'Выберите адрес компьютера и нажмите «Подключить». В HSD выберите CarbitLink по Wi-Fi. IP компьютера можно указать вручную.',
+            'welink': 'Откройте WeLink A1 на телефоне и разрешите доступ к USB-аксессуару.',
+            'hicar': 'Включите USB-сеть NCM на телефоне. Выберите её адрес на компьютере, нажмите «Подключить» и запустите Huawei HiCar USB в HSD.'}
+        self.wifi_hint.setText(hints[family])
+        self.usb_devices.setToolTip(f'Устройство {FAMILIES[family]}. Подключение включает AOA.')
+        self.hid_enabled.setEnabled(family == 'carlife')
+        self.capture.setEnabled(family == 'carlife')
+        self.fallback.setEnabled(family == 'carlife')
         self.demo_group.setVisible(kind == 'demo')
         self.demo_header.setVisible(kind == 'demo')
         if hasattr(self, 'driver_group'):
-            self.driver_group.setVisible(_windows_driver_ui() and kind == 'usb')
+            available = _windows_driver_ui() and kind in ('usb', 'ncm')
+            self.driver_shortcut.setVisible(available)
+            self.driver_group.setVisible(available)
+            self.driver_button.setVisible(kind == 'usb')
+            if kind == 'ncm':
+                self.driver_files.setText('Инструкция по USB NCM')
+                self.driver_status.setText('Для HiCar включите USB NCM на телефоне. Windows 11 использует '
+                                           'сетевой драйвер UsbNcm. Обновите список адресов и выберите USB-сеть.')
+            elif kind == 'usb':
+                self.driver_files.setText('Папка Drivers')
+                self.driver_status.setText(f'Для {FAMILIES[family]} по USB нужен WinUSB. Если после перехода в AOA '
+                                           'виден только ADB, проверьте интерфейс аксессуара. В папке Drivers есть '
+                                           'Zadig и инструкция для ручной установки без интернета.')
+
+    def show_windows_drivers(self):
+        self.tabs.setCurrentIndex(self.hud_tab_index)
+        self.inspector.currentWidget().ensureWidgetVisible(self.driver_group)
+
+    def open_driver_files(self):
+        drivers = Path(__file__).resolve().parents[1] / 'Drivers'
+        target = drivers / 'README.ru.txt' if self.transport.currentData() == 'ncm' else drivers
+        if not target.exists() or not QDesktopServices.openUrl(QUrl.fromLocalFile(str(target))):
+            self.driver_status.setText('Распакуйте Windows ZIP целиком. Папка Drivers должна находиться рядом с HSDHeadUnitEmulator.exe.')
 
     def refresh_wifi(self):
         if self.busy or self.client or self.closing:
@@ -1076,8 +1204,9 @@ class HeadUnitWindow(QMainWindow):
         dialog.setWindowTitle('Настройка WinUSB')
         dialog.setIcon(QMessageBox.Icon.Question)
         register = plan.action == 'register'
-        dialog.setText('Зарегистрировать интерфейс CarLife?' if register else
-                       'Назначить системный драйвер Microsoft WinUSB интерфейсу CarLife?')
+        protocol = self.family.currentText()
+        dialog.setText(f'Зарегистрировать интерфейс {protocol}?' if register else
+                       f'Назначить системный драйвер Microsoft WinUSB интерфейсу {protocol}?')
         dialog.setInformativeText(f'Устройство: 18D1:2D01, порт {plan.identity.physical_key}.\n'
                                   f'Интерфейс: {plan.target.hardware_id}.\n\n'
                                   + ('WinUSB уже назначен. Будет зарегистрирован путь доступа для приложений.'
@@ -1094,13 +1223,14 @@ class HeadUnitWindow(QMainWindow):
     def setup_windows_driver(self):
         if not _windows_driver_ui() or self.busy or self.client or self.closing or self.transport.currentData() != 'usb':
             return
+        protocol = self.family.currentText()
         def note(text):
             self.driver_status.setText(text)
             self.log_event('WinUSB: ' + text)
         def failure(error):
             note(str(error))
         def finished(outcome):
-            note({'ready':'Интерфейс CarLife проверен. Можно нажать «Подключить».',
+            note({'ready':f'Интерфейс {protocol} проверен. Можно нажать «Подключить».',
                   'cancelled':'Настройка отменена.',
                   'reboot':'Windows запросила перезагрузку. После неё снова проверьте интерфейс.',
                   'reconnect':'Доступ к каналам ещё не подтверждён. Переподключите телефон и повторите проверку.'
@@ -1113,7 +1243,7 @@ class HeadUnitWindow(QMainWindow):
             if self.closing:
                 self.close()
             elif plan.action == 'ready':
-                note('Интерфейс CarLife уже доступен через WinUSB. Ничего устанавливать не нужно.')
+                note(f'Интерфейс {protocol} уже доступен через WinUSB. Ничего устанавливать не нужно.')
             elif self._confirm_driver_setup(plan) and not self.closing:
                 note('Ожидание ответа Windows…')
                 self.submit(lambda: apply_setup(plan), finished, on_error=failure)
@@ -1122,6 +1252,10 @@ class HeadUnitWindow(QMainWindow):
         item = self.usb_devices.currentData()
         if not item:
             note('Сначала выберите телефон в списке USB.')
+            return
+        if (item['vid'], item['pid']) == (0x18d1, 0x2d00):
+            note('Выбран USB-аксессуар 18D1:2D00 с одной функцией. Нажмите «Подключить». '
+                 'Если WinUSB недоступен, откройте папку Drivers и следуйте инструкции для 2D00.')
             return
         identity = USBIdentity(**{**item, 'ports':tuple(item['ports'])})
         self.error_label.hide()
@@ -1209,12 +1343,19 @@ class HeadUnitWindow(QMainWindow):
         ident = self.usb_devices.currentData()
         kind = self.transport.currentData()
         if kind == 'usb' and not ident:
-            raise ValueError('Подключите CarLife-устройство и обновите список USB.')
+            raise ValueError('Подключите телефон и обновите список USB.')
         if self.width.value() % 2 or self.height.value() % 2:
             raise ValueError('Для H.264 выберите чётные ширину и высоту.')
+        family = self.family.currentData()
+        listen = family != 'carlife' and kind != 'usb'
+        if listen and not self.local_interface.currentData():
+            raise ValueError('Выберите сетевой интерфейс компьютера')
         return DesktopConfig(transport='tcp' if kind == 'demo' else kind,
-            profile=DESKTOP_PROFILE,
-            host=self.wifi_host.currentText().strip() if kind == 'wifi' else self.host.text().strip(),
+            profile=self.protocol_profile.currentData() if family == 'carlife' else family, oem_channel=self.oem_channel.text().strip(),
+            cuid=self.cuid.text().strip(), night_mode=self.theme_variant == 'dark',
+            require_encryption=self.require_encryption.isChecked(), registration_file=self.registration_file.text().strip(),
+            host=self.local_interface.currentData() if listen else self.wifi_host.currentText().strip() if kind == 'wifi' else self.host.text().strip(),
+            prefix_length=self.local_interface.currentData(Qt.UserRole+1) if listen else 24,
             port=7240 if kind == 'wifi' else self.port.value(),
             usb_identity=USBIdentity(**{**ident,'ports':tuple(ident['ports'])}) if kind == 'usb' else None,
             width=self.width.value(),height=self.height.value(),fps=self.fps.value(),
@@ -1256,12 +1397,14 @@ class HeadUnitWindow(QMainWindow):
                                 address=item['address'], vid_pid=f"{item['vid']:04x}:{item['pid']:04x}")
             except (KeyError, TypeError, ValueError):
                 pass  # No complete picker identity to report; do not guess one.
-        attempt = dict(application='CarLife HeadUnit Emulator', version=VERSION, platform=sys.platform,
+        attempt = dict(application='HSD HeadUnit Emulator', version=VERSION, platform=sys.platform,
                        architecture=platform.machine(), attempt_id=output.name, session_id=None,
                        state='CONNECTING', started_at=started_at.isoformat(), error=None, demo=demo_mode,
-                       transport=kind, profile=DESKTOP_PROFILE,
+                       transport=kind, profile=self.protocol_profile.currentData() if self.family.currentData() == 'carlife' else self.family.currentData(),
                        backend='DIRECT_USB_AOA' if kind == 'usb' else 'TCP6_WIFI' if kind == 'wifi' else 'TCP_STREAM',
                        selected_identity=selected, decoded_frames=0)
+        if self.family.currentData() != 'carlife':
+            attempt['backend'] = self.family.currentData().upper() + '_' + kind.upper()
         self.last_report = attempt
         cancel = threading.Event() if kind == 'usb' and configuration_error is None else None
         self.usb_connect_cancel = cancel
@@ -1289,7 +1432,10 @@ class HeadUnitWindow(QMainWindow):
                 stage = 'start_client'
                 client.start()
                 stage = 'start_keyboard'
-                keyboard = HIDKeyboard.for_client(client) if hid_enabled else HIDKeyboard(unavailable_reason='USB-клавиатура отключена в настройках')
+                if local_config.profile in ('carbit', 'welink', 'hicar'):
+                    keyboard = HIDKeyboard(unavailable_reason='В этом протоколе эмулятор передаёт касания')
+                else:
+                    keyboard = HIDKeyboard.for_client(client) if hid_enabled else HIDKeyboard(unavailable_reason='USB-клавиатура отключена в настройках')
                 # Optional HID must not issue control requests while Android
                 # is opening the accessory and negotiating the CarLife stream.
                 if not hid_enabled or client.backend != 'DIRECT_USB_AOA':
@@ -1543,7 +1689,7 @@ class HeadUnitWindow(QMainWindow):
             # This snapshot describes one attempt; cumulative UI counters and
             # history may belong to an earlier, entirely unrelated session.
             return result
-        result.update(application='CarLife HeadUnit Emulator',version=VERSION,architecture=platform.machine(),sessions=self.history,
+        result.update(application='HSD HeadUnit Emulator',version=VERSION,architecture=platform.machine(),sessions=self.history,
                       frame_wake=self.frame_wake.snapshot(),macos_activity=self.activity.snapshot())
         return result
 
@@ -1567,13 +1713,18 @@ class HeadUnitWindow(QMainWindow):
         self.scan_button.setEnabled(not connected and not self.busy)
         if hasattr(self, 'driver_button'):
             self.driver_button.setEnabled(not connected and not self.busy and not self.closing)
-        for widget in (self.transport, self.usb_devices, self.host, self.port, self.wifi_host,
-                       self.wifi_scan, self.touch_profile, self.hid_enabled):
+        for widget in (self.family, self.local_group, self.transport, self.usb_devices, self.host, self.port, self.wifi_host,
+                       self.wifi_scan, self.touch_profile, self.hid_enabled, self.protocol_profile,
+                       self.oem_channel, self.cuid, self.require_encryption, self.registration_file.parentWidget()):
             widget.setEnabled(not connected and not self.busy)
-        self.reset_button.setEnabled(bool(streaming))
-        self.pause_button.setEnabled(bool(connected and not self.busy and self.client.session.state in ('STREAMING','PAUSED')))
+        if self.family.currentData() != 'carlife':
+            self.hid_enabled.setEnabled(False)
+        self.reset_button.setEnabled(bool(streaming and hasattr(self.client, 'reset')))
+        self.pause_button.setEnabled(bool(connected and hasattr(self.client, 'pause') and not self.busy and self.client.session.state in ('STREAMING','PAUSED')))
         self.pause_button.setText('Продолжить видео' if connected and self.client.session.state == 'PAUSED' else 'Пауза видео')
-        for b in self.stream_buttons: b.setEnabled(bool(streaming))
+        for b in self.stream_buttons:
+            available = getattr(self.client, 'hard_keys', None)
+            b.setEnabled(bool(streaming and (available is None or b.property('hardKey') in available)))
         multi = streaming and self.client.touch_profile != 'LEGACY_SINGLE'
         self.pinch_in.setEnabled(bool(multi)); self.pinch_out.setEnabled(bool(multi))
         self.update_keyboard_status()
@@ -1623,11 +1774,14 @@ class HeadUnitWindow(QMainWindow):
                 self.state.setText('●  ' + {'STREAMING': 'Подключено', 'PAUSED': 'Видео приостановлено',
                     'WAIT_VERSION': 'Согласование протокола…', 'WAIT_VIDEO': 'Ожидание видео…',
                     'CLOSED': 'Отключено'}.get(state, 'Подключение…'))
-                self.log_event('Протокол: ' + state)
+                self.log_event(getattr(client, 'detail', None) or ('Протокол: ' + state))
+                if state in ('WAIT_PHONE', 'WAIT_AUTH'):
+                    self.state.setText('●  ' + ('Ожидание телефона' if state == 'WAIT_PHONE' else 'Сопряжение'))
+                    self.notice.setText(client.detail)
                 if state == 'STREAMING':
                     requested = client.session.requested
                     accepted = client.session.accepted or {}
-                    self.notice.setText(('ДЕМО • ' if self.demo else 'CARLIFE • ') +
+                    self.notice.setText(('ДЕМО • ' if self.demo else FAMILIES[self.family.currentData()] + ' • ') +
                         f'запрос {requested["width"]} × {requested["height"]} / {requested["fps"]} fps → '
                         f'MD {client.session.width} × {client.session.height} / {client.session.fps} fps • мышь управляет экраном')
                     if (requested['width'],requested['height'],requested['fps']) != (client.session.width,client.session.height,client.session.fps):
@@ -1671,6 +1825,17 @@ class HeadUnitWindow(QMainWindow):
     def load_settings(self):
         try: saved = json.loads((self.data_dir/'settings.json').read_text(encoding='utf-8'))
         except (OSError,ValueError): return
+        if saved.get('family') in FAMILIES:
+            self.family.setCurrentIndex(self.family.findData(saved['family']))
+        local = self.local_interface.findData(saved.get('local_address'))
+        if local >= 0:
+            self.local_interface.setCurrentIndex(local)
+        if saved.get('profile') in VERSIONS:
+            self.protocol_profile.setCurrentIndex(self.protocol_profile.findData(saved['profile']))
+        self.require_encryption.setChecked(saved.get('require_encryption') is True)
+        for name in ('oem_channel', 'cuid', 'registration_file'):
+            if isinstance(saved.get(name), str) and saved[name]:
+                getattr(self, name).setText(saved[name])
         for name in ('transport','touch_profile','fit','rotation','theme','keyboard_layout'):
             widget = getattr(self,name)
             for n in range(widget.count()):
@@ -1688,7 +1853,10 @@ class HeadUnitWindow(QMainWindow):
 
     def save_settings(self):
         saved = {name:getattr(self,name).currentData() for name in ('transport','touch_profile','fit','rotation','theme','keyboard_layout')}
-        saved['profile'] = DESKTOP_PROFILE
+        saved.update(family=self.family.currentData(), local_address=self.local_interface.currentData(),
+                     profile=self.protocol_profile.currentData(), oem_channel=self.oem_channel.text(),
+                     cuid=self.cuid.text(), require_encryption=self.require_encryption.isChecked(),
+                     registration_file=self.registration_file.text())
         saved['wifi_host'] = self.wifi_host.currentText().strip()
         saved.update({name:getattr(self,name).value() for name in ('width','height','fps','port','volume')})
         saved.update(host=self.host.text(),muted=self.muted.isChecked(),fallback=self.fallback.isChecked(), settings_version=2, hid_enabled=self.hid_enabled.isChecked())
@@ -1726,27 +1894,38 @@ def default_data_dir():
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='CarLife HeadUnit Emulator for macOS arm64 and Windows x64')
+    parser = argparse.ArgumentParser(description='HSD HeadUnit Emulator for macOS arm64 and Windows x64')
     parser.add_argument('--data-dir',type=Path,default=default_data_dir())
     parser.add_argument('--demo',action='store_true')
     parser.add_argument('--usb',metavar='PHYSICAL_KEY',help='connect only this explicitly selected USB port')
     parser.add_argument('--wifi',metavar='PHONE_IP',help='connect native CarLife over six Wi-Fi TCP channels')
     parser.add_argument('--aoa-start',action='store_true',help='compatibility option; AOA is always enabled for the selected --usb device')
-    parser.add_argument('--profile',choices=(DESKTOP_PROFILE,),
-                        help='compatibility option; desktop sessions always use Honda v2')
+    parser.add_argument('--protocol', choices=FAMILIES, help='Projection protocol family')
+    parser.add_argument('--listen', metavar='LOCAL_IPV4', help='Listen on this Wi-Fi (CarbitLink) or USB-NCM (HiCar) interface')
+    parser.add_argument('--profile',choices=(DESKTOP_PROFILE, *VERSIONS), help='CarLife HU protocol profile')
     parser.add_argument('--width',type=int)
     parser.add_argument('--height',type=int)
     parser.add_argument('--fps',type=int)
     parser.add_argument('--smoke-test',type=float,metavar='SECONDS')
     arguments = parser.parse_args(argv)
-    if sum(bool(value) for value in (arguments.demo, arguments.usb, arguments.wifi)) > 1:
+    if sum(bool(value) for value in (arguments.demo, arguments.usb, arguments.wifi, arguments.listen)) > 1:
         parser.error('--demo, --usb and --wifi are mutually exclusive')
     if arguments.aoa_start and not arguments.usb:
         parser.error('--aoa-start requires an explicit --usb port')
     app = QApplication.instance() or QApplication(sys.argv[:1])
-    app.setApplicationName('CarLife HeadUnit Emulator')
+    app.setApplicationName('HSD HeadUnit Emulator')
     app.setOrganizationName('CarLife Lab')
     window = HeadUnitWindow(arguments.data_dir)
+    if arguments.protocol:
+        window.family.setCurrentIndex(window.family.findData(arguments.protocol))
+    elif arguments.demo or arguments.wifi or arguments.profile or arguments.usb:
+        window.family.setCurrentIndex(window.family.findData('carlife'))
+    if arguments.listen and window.family.currentData() not in ('carbit', 'hicar'):
+        parser.error('--listen requires CarbitLink or HiCar')
+    if arguments.profile and window.family.currentData() != 'carlife':
+        parser.error('--profile selects a CarLife version')
+    if arguments.profile:
+        window.protocol_profile.setCurrentIndex(window.protocol_profile.findData(arguments.profile))
     for name in ('width','height','fps'):
         value = getattr(arguments,name)
         if value is not None:
@@ -1755,8 +1934,16 @@ def main(argv=None):
                 parser.error(f'--{name} outside {widget.minimum()}..{widget.maximum()}')
             widget.setValue(value)
     window.show()
-    if arguments.demo or arguments.usb or arguments.wifi:
+    if arguments.demo or arguments.usb or arguments.wifi or arguments.listen:
         kind = 'demo' if arguments.demo else 'wifi' if arguments.wifi else 'usb'
+        if arguments.listen:
+            kind = 'ncm' if window.family.currentData() == 'hicar' else 'wifi'
+            pos = window.local_interface.findData(arguments.listen)
+            if pos < 0:
+                parser.error('--listen requires a local IPv4 interface')
+            window.local_interface.setCurrentIndex(pos)
+        if window.transport.findData(kind) < 0 or arguments.wifi and window.family.currentData() != 'carlife':
+            parser.error('This transport is unavailable for the selected protocol')
         window.transport.setCurrentIndex(window.transport.findData(kind))
         if arguments.wifi:
             window.wifi_host.setEditText(arguments.wifi)
@@ -1785,7 +1972,7 @@ def main(argv=None):
     if arguments.smoke_test is not None:
         report = window.report()
         (arguments.data_dir/'smoke-report.json').write_text(json.dumps(report,indent=2,ensure_ascii=False)+'\n', encoding='utf-8')
-        if (arguments.demo or arguments.usb or arguments.wifi) and (report.get('decoded_frames',0)==0 or report.get('error') or report.get('demo_error') or report.get('desktop_cleanup_errors')):
+        if (arguments.demo or arguments.usb or arguments.wifi or arguments.listen) and (report.get('decoded_frames',0)==0 or report.get('error') or report.get('demo_error') or report.get('desktop_cleanup_errors')):
             return 1
     return result
 

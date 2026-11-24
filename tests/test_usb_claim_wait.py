@@ -36,7 +36,7 @@ class DesktopPreflightLockTests(unittest.TestCase):
 
         def make_usb():
             # WinUSB initialization can already fail at the preflight open.
-            self.assertEqual(old_released, ['CarLife HeadUnit Emulator'])
+            self.assertEqual(old_released, ['HSD HeadUnit Emulator'])
             with self.assertRaises(BlockingIOError):
                 lock_owner(self.other)
             context = bus.factory()
@@ -195,7 +195,7 @@ class ClaimWaitTests(unittest.TestCase):
             lock_owner(old)
             stream = factory()
             try:
-                self.assertEqual(notified, ['CarLife HeadUnit Emulator'])
+                self.assertEqual(notified, ['HSD HeadUnit Emulator'])
                 self.assertEqual(self.bus.claims, [0])
                 self.assertEqual(self.bus.controls, [])
                 with self.assertRaises(BlockingIOError):
@@ -217,7 +217,7 @@ class ClaimWaitTests(unittest.TestCase):
                     if not cancel:
                         self.assertEqual(caught.exception.connection_failure['reason'], 'interface_owned')
                         self.assertAlmostEqual(sum(self.waits), 60)
-                    self.assertEqual(notified, ['CarLife HeadUnit Emulator'])
+                    self.assertEqual(notified, ['HSD HeadUnit Emulator'])
                     self.assertEqual((self.bus.controls, self.bus.claims), ([], []))
                     with open_owner_lock(self.lock_path) as probe, self.assertRaises(BlockingIOError):
                         lock_owner(probe)

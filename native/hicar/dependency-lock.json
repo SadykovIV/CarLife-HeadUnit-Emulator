@@ -1,0 +1,35 @@
+{
+  "deviceauth": {
+    "repository": "https://github.com/openharmony/security_deviceauth.git",
+    "commit": "552edb521d0bd7c17f2dab2791e7cdc3de284405"
+  },
+  "huks": {
+    "repository": "https://github.com/openharmony/security_huks.git",
+    "commit": "89f0842ef2600a0d9b5351ef11e1f8acab8ff439"
+  },
+  "securec": {
+    "repository": "https://github.com/openharmony/third_party_bounds_checking_function.git",
+    "commit": "ebef58f44419d0694e984d25acac231e737d60ff"
+  },
+  "CarLink": {
+    "repository": "https://github.com/Aki894/CarLink",
+    "commit": "6210b2fcfdcaa7da334683f09b15d51369eef440"
+  },
+  "mbedtls": {
+    "tag": "mbedtls-3.6.7",
+    "archive_sha256": "a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6",
+    "repository": "https://github.com/Mbed-TLS/mbedtls",
+    "archive": "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.7/mbedtls-3.6.7.tar.bz2"
+  },
+  "openssl": {
+    "tag": "openssl-3.5.9",
+    "archive_sha256": "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a",
+    "repository": "https://github.com/openssl/openssl",
+    "archive": "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz"
+  },
+  "cjson": {
+    "tag": "v1.7.19",
+    "archive_sha256": "7fa616e3046edfa7a28a32d5f9eacfd23f92900fe1f8ccd988c1662f30454562",
+    "repository": "https://github.com/DaveGamble/cJSON"
+  }
+}

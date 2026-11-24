@@ -27,6 +27,14 @@ Baidu CarLife, Android Auto, CarPlay, Carlinkit, Honda and Alpine names identify
 
 ## Desktop distribution
 
+The Windows ZIP includes the unmodified Zadig 2.9 executable by Akeo Consulting as a standalone tool with its embedded WinUSB installation resources. The corresponding libwdi 1.5.1 source archive and the GPLv3 and LGPLv3 license texts are distributed in `licenses/Zadig`. Zadig uses GPL-3.0-or-later and libwdi uses LGPL-3.0-or-later. [Zadig](https://zadig.akeo.ie/) · [Source release](https://github.com/pbatard/libwdi/releases/tag/v1.5.1)
+
+Authenticated CarLife profiles use the Python cryptography package, CFFI and pycparser. Their licenses accompany the desktop builds.
+
 CarLife HeadUnit Emulator is extracted from [Carlife_on_box](https://github.com/SadykovIV/Carlife_on_box). Original project attribution is retained in NOTICE. The packaged desktop application includes CPython, Qt/PySide6, PyAV/FFmpeg, Pillow and libusb; their available license texts are included alongside the binaries. Build tools are separately installed.
 
 The Baidu CarLife icon comes from the official Baidu App Store listing. The original artwork and its provenance are in `hu_lab/assets/ICON_SOURCE.json`. The icon and product marks remain the property of their owners, are excluded from the Apache-2.0 grant for project code, and do not imply endorsement.
+
+## Huawei HiCar interoperability
+
+Nearby, HiChain binding, DMSDP, HiSight, UIBC and AAC framing are adapted from the MIT-licensed [CarLink receiver](https://github.com/Aki894/CarLink/tree/6210b2fcfdcaa7da334683f09b15d51369eef440/experiments/hicar). The desktop receiver adds wired discovery, pairing and Qt playback. OpenHarmony DeviceAuth and HUKS, bounds checking functions, Mbed TLS, cJSON and OpenSSL are linked into the desktop native library. Pinned revisions are in `native/hicar/dependency-lock.json`. Notices ship in `licenses/HiCar`.

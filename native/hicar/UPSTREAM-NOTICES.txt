@@ -1,0 +1,31 @@
+Nearby framing, HiChain integration, DMSDP, HiSight, UIBC and audio transport are adapted from Aki894/CarLink for the desktop receiver. See dependency-lock.json for source revisions.
+Commit 6210b2fcfdcaa7da334683f09b15d51369eef440
+https://github.com/Aki894/CarLink
+
+MIT License
+
+Copyright (c) 2026 CarLink contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+Native authentication and static dependencies:
+OpenHarmony DeviceAuth commit 552edb521d0bd7c17f2dab2791e7cdc3de284405; HUKS commit 89f0842ef2600a0d9b5351ef11e1f8acab8ff439; securec commit ebef58f44419d0694e984d25acac231e737d60ff. DeviceAuth and HUKS: Apache-2.0 (retain source-specific notices). securec: MulanPSL-2.0. See packaged licenses and matching source.
+Mbed TLS 3.6.7 is distributed under its Apache-2.0 option. OpenSSL 3.5.9 uses Apache-2.0. cJSON 1.7.19 uses MIT. The license texts accompany this file in the desktop package.
+The desktop port adds a native library for macOS and Windows, local HUKS storage, Python framing and receiver integration.

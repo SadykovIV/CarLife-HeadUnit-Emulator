@@ -1,36 +1,38 @@
-# CarLife HeadUnit Emulator
+# HSD HeadUnit Emulator
 
-**Stable release 0.5.1 · updated 14 November 2026** · [Русский](README.ru.md) · [Downloads](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/tag/v0.5.1) · [Changelog](CHANGELOG.md)
+**Stable release 0.6.0 · 24 November 2026** · [Русский](README.ru.md) · [Downloads](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/tag/v0.6.0) · [Changelog](CHANGELOG.md)
 
-An independent hobby desktop application that emulates a Baidu CarLife head unit for testing a compatible phone or Android box. It displays the projected video, plays received audio and sends touch, keyboard and media input. Extracted from [Carlife_on_box](https://github.com/SadykovIV/Carlife_on_box), with one Qt interface and session implementation for macOS and Windows.
+A desktop head unit for CarLife, CarbitLink, WeLink A1 and Huawei HiCar. Select the protocol and transport at the top of the window to display phone video, send touch input and play audio on supported transports. [Connection guide and capabilities](docs/PROJECTION_RECEIVERS.md)
+
+The Windows ZIP includes the offline WinUSB installation kit and Zadig 2.9. Select **Драйверы USB** to open the setup for your transport. Huawei HiCar uses a CDC-NCM network adapter.
 
 **The application interface is currently in Russian.** This is not an official Baidu or Honda product. It does not install Android components or modify device firmware.
 
-**New in 0.5.1.** Connect a phone over Wi-Fi, use two fingers to move, zoom or rotate a map, and see artwork for the current track in the instrument cluster. Audio playback runs independently of the window while it handles gestures and redraws.
+The renamed app uses your existing CarLife settings and reports. The original project is [Carlife_on_box](https://github.com/SadykovIV/Carlife_on_box).
 
 For **Wizcar A2** over USB, unplug and reconnect the adapter after ending a session, then refresh the USB list and connect again.
 
 ## Download and run
 
-Choose the **0.5.1** ZIP for your computer. Python, Qt and the other runtime libraries are included.
+Choose the **0.6.0** ZIP for your computer. Python, Qt and the other runtime libraries are included.
 
 | Download | Requirements and launch |
 | --- | --- |
-| [macOS arm64 ZIP](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/download/v0.5.1/CarLife-HeadUnit-Emulator-0.5.1-macOS-arm64.zip) | Apple Silicon, **macOS 26+**. Extract and open `CarLife HeadUnit Emulator.app`. |
-| [Windows x64 ZIP](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/download/v0.5.1/CarLife-HeadUnit-Emulator-0.5.1-Windows-x64.zip) | Extract the **whole folder** and run `CarLifeHeadUnitEmulator.exe` as a normal user. Keep it next to `runtime`. |
+| [macOS arm64 ZIP](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/download/v0.6.0/HSD-HeadUnit-Emulator-0.6.0-macOS-arm64.zip) | Apple Silicon, **macOS 26+**. Extract and open `HSD HeadUnit Emulator.app`. |
+| [Windows x64 ZIP](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/download/v0.6.0/HSD-HeadUnit-Emulator-0.6.0-Windows-x64.zip) | Extract the **whole folder** and run `HSDHeadUnitEmulator.exe` as a normal user. Keep it next to `runtime`. |
 
 The macOS app has an ad hoc signature and is not notarized. The Windows app and its driver helper are not Authenticode signed.
 
-[SHA256 checksums](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/download/v0.5.1/SHA256SUMS) · [Release manifest and validation results](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/download/v0.5.1/RELEASE.json) · [Source ZIP](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/download/v0.5.1/CarLife-HeadUnit-Emulator-0.5.1-source.zip)
+[SHA256 checksums](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/download/v0.6.0/SHA256SUMS) · [Source ZIP](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/archive/refs/tags/v0.6.0.zip)
 
 Select **«Демо»** (Demo) in the top connection bar to try the application without a device. The demo generates local H.264 video and PCM audio; it does not establish hardware compatibility. You can also launch it with `--demo`:
 
 ```sh
-open "CarLife HeadUnit Emulator.app" --args --demo
+open "HSD HeadUnit Emulator.app" --args --demo
 ```
 
 ```powershell
-& '.\CarLifeHeadUnitEmulator.exe' --demo
+& '.\HSDHeadUnitEmulator.exe' --demo
 ```
 
 ## What it does
@@ -39,7 +41,7 @@ open "CarLife HeadUnit Emulator.app" --args --demo
 
 Open **«Приборка и HUD»** to keep the phone projection on the left and see the next maneuver, distance, track and artist on the right. To try it without a phone or car, click **«Запустить демо приборки»**. With a phone connected, start a route or play music on it: navigation and music are negotiated independently and shown when the phone sends them. A received PNG provides the turn arrow; otherwise the panel uses the maneuver code.
 
-The desktop uses **CarLife v2 · Honda** for USB, Wi-Fi, compatible TCP streams and demo sessions. There is no protocol selector.
+The default is **CarLife v2 · Honda**. Under **Приборка и HUD → Протокол CarLife**, versions 2.1, 3.0, 3.1, 4.0 and 4.1 support authentication and negotiated encryption. [Configuration and compatibility (Russian)](docs/CARLIFE_AUTH.md)
 
 ### Reconnecting over USB
 
@@ -54,7 +56,7 @@ Select **USB**, your phone and **«Подключить»** (Connect). If the pi
 - **`18d1:2d00`** is an accessory without ADB. Use Connect; the driver wizard does not configure this ID. Android USB debugging is not required for CarLife.
 - **`18d1:2d01`** has separate CarLife and ADB functions. Leave a working connection alone. Otherwise end the active session and use **«Приборка и HUD» → «Настроить WinUSB…»**. Check the physical port and **`USB\VID_18D1&PID_2D01&MI_00`**. **«Зарегистрировать»** registers an access path for an existing WinUSB binding; **«Назначить WinUSB»** may replace the driver on that interface only. Only the helper requests elevation after confirmation. Click Connect manually when the setup check passes.
 
-The [first-connection and manual Zadig guide (Russian)](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/download/v0.5.1/CarLife-Windows-first-connection-ru.txt) explains how to identify the exact CarLife **MI_00** in Device Manager. Leave the composite parent, MTP, modem and ADB/MI_01 unchanged. If only `&ADB` is visible or Windows cannot identify a separate MI_00, skip installation and use **«Диагностика» → «Экспорт отчёта»** for the stage and original error of the current attempt.
+For manual installation open **Драйверы USB → Папка Drivers**. For 18D1:2D01 select **Interface 0 / MI_00** in Zadig. The included guide also covers the single-function 18D1:2D00 accessory. [Windows driver guide (Russian)](windows/DRIVERS.ru.txt)
 
 ### Emulator features
 
@@ -115,7 +117,7 @@ brew install libusb
 ./tools/build-mac-headunit
 ```
 
-Output: `dist/CarLife HeadUnit Emulator.app`. The builder verifies architecture, local signature, runtime imports and native dependency paths. `HU_PYTHON=/absolute/path/to/python` selects a different interpreter; `--libusb /path/to/libusb-1.0.dylib` selects the library.
+Output: `dist/HSD HeadUnit Emulator.app`. The builder verifies architecture, local signature, runtime imports and native dependency paths. `HU_PYTHON=/absolute/path/to/python` selects a different interpreter; `--libusb /path/to/libusb-1.0.dylib` selects the library.
 
 The Windows x64 builder runs on macOS or Linux with Python, Pillow and LLVM tools (`clang`, `lld-link`, `llvm-dlltool`, `llvm-rc`). On macOS, install LLVM with `brew install llvm`, then:
 
@@ -136,7 +138,6 @@ python -m hu_lab.desktop --demo --smoke-test 8 --data-dir /tmp/carlife-smoke
 
 The tests use local loopback sockets and mocked USB/Windows APIs; without Qt/PyAV, desktop tests may be skipped. The smoke run writes `smoke-report.json` and `smoke-window.png` in the chosen directory. On Windows, choose a writable Windows path. Run the packaged `Verify.cmd` to check libraries and codecs, or `VerifyUsbRuntime.cmd` to check the bundled USB DLL and its runtime APIs. Neither check establishes that a particular phone driver can carry CarLife traffic.
 
-The [0.5.1 release manifest](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/download/v0.5.1/RELEASE.json) lists the checks for this release. For the previous USB fix and its physical Wizcar A2 test on macOS, see the [0.4.1 validation record](https://github.com/SadykovIV/CarLife-HeadUnit-Emulator/releases/download/v0.4.1/RELEASE.json).
 
 Settings and session data retain the earlier directory name for compatibility: `~/Library/Application Support/CarLife HeadUnit/` on macOS and `%LOCALAPPDATA%\CarLife HeadUnit\` on Windows. Override it with `--data-dir`.
 
